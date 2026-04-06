@@ -17,10 +17,6 @@ def generate_baby_upper_2d_mesh(
     r_heater = 0.439
     r_cllif = 7.000
     r_inconel = 7.300
-    # r_he = 9.144
-    # r_firebrick = 12.002
-    # r_vessel = 12.853
-    # r_external = 13.272
 
     # =========================================================
     # Axial thicknesses [cm]
@@ -34,10 +30,6 @@ def generate_baby_upper_2d_mesh(
     t_cllif = 6.388 + 0.13022
     t_gap = 4.605
     t_cap = 1.422
-    # t_firebrick = 15.240
-    # t_high = 21.093
-    # t_cover = 2.392
-    # t_heater = 25.400  # heater extends beyond the vessel top, but we will keep it the same for the top part of the vessel and the cap for simplicity
 
     # =========================================================
     # Axial coordinates (absolute positions, cm)
@@ -54,14 +46,6 @@ def generate_baby_upper_2d_mesh(
     y6 = y5 + t_gap
     y7 = y6 + t_cap
 
-    # Other important heights
-    # y_firebrick_top = y2 + t_firebrick
-    # y_high_top = y0 + t_high
-    # y_cover_top = y_high_top + t_cover
-
-    # t_heater = y_cover_top - (
-    #     y4 + t_heater_gap
-    # )  # heater extends from its bottom to the top cover
     t_heater = y7 - (y4 + t_heater_gap)
 
     # Heater
@@ -70,10 +54,8 @@ def generate_baby_upper_2d_mesh(
 
     # Base
     y_base_bottom = y0
-    y_base_top = y1
 
     # Alumina
-    y_alumina_bottom = y1
     y_alumina_top = y2
 
     # Helium layer
@@ -99,32 +81,6 @@ def generate_baby_upper_2d_mesh(
     # =========================================================
 
     surfaces = {}
-
-    # =========================================================
-    # Non-helium regions defined directly
-    # =========================================================
-
-    # ---------------------------------------------------------
-    # Inconel 625 vessel: bottom plate
-    # ---------------------------------------------------------
-    # surfaces["vessel_bottom"] = occ.addRectangle(
-    #     r_axis, y_base_bottom, 0, r_external, t_base
-    # )
-
-    # ---------------------------------------------------------
-    # Alumina insulation
-    # ---------------------------------------------------------
-    # surfaces["alumina"] = occ.addRectangle(
-    #     r_axis, y_alumina_bottom, 0, r_vessel, t_alumina
-    # )
-
-    # ---------------------------------------------------------
-    # Inconel 625 vessel: cylindrical side wall
-    # ---------------------------------------------------------
-    # surfaces["vessel_side"] = occ.addRectangle(
-    #     r_vessel, y_base_top, 0, r_external - r_vessel, y_high_top - y_base_top
-    # )
-
     # ---------------------------------------------------------
     # Inconel 625 cap: bottom part
     # ---------------------------------------------------------
@@ -164,20 +120,6 @@ def generate_baby_upper_2d_mesh(
         r_heater, y_gap_top, 0, r_inconel - r_heater, t_cap
     )
 
-    # ---------------------------------------------------------
-    # Firebrick insulation
-    # ---------------------------------------------------------
-    # surfaces["firebrick"] = occ.addRectangle(
-    #     r_he, y_alumina_top, 0, r_firebrick - r_he, y_firebrick_top - y_alumina_top
-    # )
-
-    # ---------------------------------------------------------
-    # Inconel 625 vessel: top cover
-    # ---------------------------------------------------------
-    # surfaces["vessel_top"] = occ.addRectangle(
-    #     r_heater, y_high_top, 0, r_external - r_heater, t_cover
-    # )
-
     occ.synchronize()
 
     # =========================================================
@@ -186,13 +128,9 @@ def generate_baby_upper_2d_mesh(
     # to the top of the high section, after subtracting:
     # - cap regions
     # - CLLiF
-    # - firebrick
     # - heater
     # =========================================================
 
-    # helium_box_out = occ.addRectangle(
-    #     r_axis, y_alumina_top, 0, r_vessel, y_high_top - y_alumina_top
-    # )
     helium_box_out = occ.addRectangle(
         r_axis, y_alumina_top, 0, r_inconel, y7 - y_alumina_top
     )
@@ -202,8 +140,6 @@ def generate_baby_upper_2d_mesh(
         (2, surfaces["IV_bottom"]),
         (2, surfaces["IV_wall"]),
         (2, surfaces["IV_top"]),
-        # (2, surfaces["cllif_lower"]),
-        # (2, surfaces["cllif_upper"]),
         # (2, surfaces["firebrick"]),
         (2, surfaces["heater"]),
     ]
