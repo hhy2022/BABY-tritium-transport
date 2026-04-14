@@ -4,7 +4,7 @@ import gmsh
 def generate_baby_upper_2d_mesh(
     fname="baby_2d.msh",
     show_gui=True,
-    mesh_size=0.002,
+    mesh_size=0.001,
 ):
     gmsh.initialize()
     gmsh.model.add("BABY_upper_2D_OpenMC_based")
@@ -188,8 +188,15 @@ def generate_baby_upper_2d_mesh(
     # =========================================================
     # Boundary groups
     # =========================================================
-    outside_inconel = gmsh.model.addPhysicalGroup(1, [1, 2, 6, 12, 13], tag=10)
-    gmsh.model.setPhysicalName(1, outside_inconel, "outside_inconel")
+    # outside_inconel = gmsh.model.addPhysicalGroup(1, [1, 2, 6, 12, 13], tag=10)
+    # gmsh.model.setPhysicalName(1, outside_inconel, "outside_inconel")
+
+    inconel_outer_bottom = gmsh.model.addPhysicalGroup(1, [1], tag=31)
+    gmsh.model.setPhysicalName(1, inconel_outer_bottom, "inconel_outer_bottom")
+    inconel_outer_side = gmsh.model.addPhysicalGroup(1, [2, 6], tag=32)
+    gmsh.model.setPhysicalName(1, inconel_outer_side, "inconel_outer_side")
+    inconel_outer_top = gmsh.model.addPhysicalGroup(1, [12, 13], tag=33)
+    gmsh.model.setPhysicalName(1, inconel_outer_top, "inconel_outer_top")
 
     left_symmetry_liquid = gmsh.model.addPhysicalGroup(1, [17], tag=21)
     gmsh.model.setPhysicalName(1, left_symmetry_liquid, "left_symmetry_liquid")
