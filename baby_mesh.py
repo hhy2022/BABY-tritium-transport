@@ -185,6 +185,15 @@ def generate_baby_upper_2d_mesh(
             gmsh.model.addPhysicalGroup(2, tags, group_id)
             gmsh.model.setPhysicalName(2, group_id, name)
 
+    # Color volume regions
+    # inconel625 -> steel blue
+    for tag in physical_surfaces["inconel625"]:
+        gmsh.model.setColor([(2, tag)], 100, 149, 237)
+
+    # cllif_natural -> amber
+    for tag in physical_surfaces["cllif_natural"]:
+        gmsh.model.setColor([(2, tag)], 255, 180, 50)
+
     # =========================================================
     # Boundary groups
     # =========================================================
@@ -264,7 +273,26 @@ def generate_baby_upper_2d_mesh(
     # =========================================================
     # Mesh
     # =========================================================
+    # =========================================================
+    # Mesh
+    # =========================================================
     gmsh.model.mesh.setSize(gmsh.model.getEntities(0), mesh_size)
+
+    # Refine mesh near the CLLiF/Inconel interface
+    f_dist = gmsh.model.mesh.field.add("Distance")
+    gmsh.model.mesh.field.setNumbers(f_dist, "CurvesList", curve_tags_1)
+
+    f_thresh = gmsh.model.mesh.field.add("Threshold")
+    gmsh.model.mesh.field.setNumber(f_thresh, "InField", f_dist)
+    gmsh.model.mesh.field.setNumber(
+        f_thresh, "SizeMin", mesh_size / 5
+    )  # 0.0002 m near interface
+    gmsh.model.mesh.field.setNumber(f_thresh, "SizeMax", mesh_size)  # 0.001 m far away
+    gmsh.model.mesh.field.setNumber(f_thresh, "DistMin", 0.002)  # refine within 2mm
+    gmsh.model.mesh.field.setNumber(f_thresh, "DistMax", 0.010)  # transition over 10mm
+
+    gmsh.model.mesh.field.setAsBackgroundMesh(f_thresh)
+
     gmsh.model.mesh.generate(2)
     gmsh.write(fname)
 
