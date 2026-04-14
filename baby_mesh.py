@@ -4,32 +4,35 @@ import gmsh
 def generate_baby_upper_2d_mesh(
     fname="baby_2d.msh",
     show_gui=True,
-    mesh_size=0.20,
+    mesh_size=0.002,
 ):
     gmsh.initialize()
     gmsh.model.add("BABY_upper_2D_OpenMC_based")
     occ = gmsh.model.occ
+    # =========================================================
+    # Unit conversion
+    # =========================================================
+    cm = 1e-2
 
     # =========================================================
-    # Radial dimensions [cm]
+    # Radial dimensions [m]
     # =========================================================
     r_axis = 0.0
-    r_heater = 0.439
-    r_cllif = 7.000
-    r_inconel = 7.300
+    r_heater = 0.439 * cm
+    r_cllif = 7.000 * cm
+    r_inconel = 7.300 * cm
 
     # =========================================================
-    # Axial thicknesses [cm]
+    # Axial thicknesses [m]
     # =========================================================
-    t_base = 0.786
-    t_alumina = 0.635
-    t_he = 0.600
-    t_inconel = 0.300
-    t_heater_gap = 0.878
-    t_cllif = 6.388 + 0.13022
-    t_gap = 4.605
-    t_cap = 1.422
-
+    t_base = 0.786 * cm
+    t_alumina = 0.635 * cm
+    t_he = 0.600 * cm
+    t_inconel = 0.300 * cm
+    t_heater_gap = 0.878 * cm
+    t_cllif = (6.388 + 0.13022) * cm
+    t_gap = 4.605 * cm
+    t_cap = 1.422 * cm
     # =========================================================
     # Axial coordinates [cm]
     # =========================================================
@@ -50,7 +53,7 @@ def generate_baby_upper_2d_mesh(
     y_IV_top = y7
 
     y_heater_bottom = y4 + t_heater_gap
-    y_heater_top = y7  # heater ends at cap top
+    # y_heater_top = y7  # heater ends at cap top
 
     # =========================================================
     # Create base surfaces
@@ -59,9 +62,9 @@ def generate_baby_upper_2d_mesh(
 
     surfaces["IV_bottom"] = occ.addRectangle(r_axis, y_he_top, 0, r_inconel, t_inconel)
 
-    surfaces["heater"] = occ.addRectangle(
-        r_axis, y_heater_bottom, 0, r_heater, y_heater_top - y_heater_bottom
-    )
+    # surfaces["heater"] = occ.addRectangle(
+    #     r_axis, y_heater_bottom, 0, r_heater, y_heater_top - y_heater_bottom
+    # )
 
     surfaces["cllif_lower"] = occ.addRectangle(
         r_axis, y_cllif_bottom, 0, r_cllif, y_heater_bottom - y_cllif_bottom
@@ -79,9 +82,9 @@ def generate_baby_upper_2d_mesh(
         r_heater, y_gap_top, 0, r_inconel - r_heater, t_cap
     )
 
-    surfaces["helium_box"] = occ.addRectangle(
-        r_heater, y_cllif_top, 0, r_cllif - r_heater, y_gap_top - y_cllif_top
-    )
+    # surfaces["helium_box"] = occ.addRectangle(
+    #     r_heater, y_cllif_top, 0, r_cllif - r_heater, y_gap_top - y_cllif_top
+    # )
 
     occ.synchronize()
 
@@ -91,8 +94,8 @@ def generate_baby_upper_2d_mesh(
         (2, surfaces["IV_top"]),
         (2, surfaces["cllif_lower"]),
         (2, surfaces["cllif_upper"]),
-        (2, surfaces["heater"]),
-        (2, surfaces["helium_box"]),
+        # (2, surfaces["heater"]),
+        # (2, surfaces["helium_box"]),
     ]
     occ.fragment(all_objects, [])
     occ.synchronize()
@@ -102,9 +105,9 @@ def generate_baby_upper_2d_mesh(
     # =========================================================
     physical_surfaces = {
         "inconel625": [],
-        "helium": [],
+        # "helium": [],
         "cllif_natural": [],
-        "heater": [],
+        # "heater": [],
     }
 
     tol = 1e-8
@@ -116,11 +119,11 @@ def generate_baby_upper_2d_mesh(
         xc, yc, _ = occ.getCenterOfMass(dim, tag)
 
         # Heater
-        if in_range(xc, r_axis, r_heater) and in_range(
-            yc, y_heater_bottom, y_heater_top
-        ):
-            physical_surfaces["heater"].append(tag)
-            continue
+        # if in_range(xc, r_axis, r_heater) and in_range(
+        #     yc, y_heater_bottom, y_heater_top
+        # ):
+        #     physical_surfaces["heater"].append(tag)
+        #     continue
 
         # CLLiF lower
         if in_range(yc, y_cllif_bottom, y_heater_bottom) and in_range(
@@ -151,10 +154,10 @@ def generate_baby_upper_2d_mesh(
             physical_surfaces["inconel625"].append(tag)
             continue
 
-        # Helium
-        if in_range(yc, y_cllif_top, y_gap_top) and in_range(xc, r_heater, r_cllif):
-            physical_surfaces["helium"].append(tag)
-            continue
+        # # Helium
+        # if in_range(yc, y_cllif_top, y_gap_top) and in_range(xc, r_heater, r_cllif):
+        #     physical_surfaces["helium"].append(tag)
+        #     continue
 
     # Remove duplicates
     for key, tags in physical_surfaces.items():
@@ -171,9 +174,9 @@ def generate_baby_upper_2d_mesh(
     # =========================================================
     physical_ids = {
         "inconel625": 1,
-        "helium": 2,
+        # "helium": 2,
         "cllif_natural": 3,
-        "heater": 4,
+        # "heater": 4,
     }
 
     for name, group_id in physical_ids.items():
@@ -188,23 +191,31 @@ def generate_baby_upper_2d_mesh(
     outside_inconel = gmsh.model.addPhysicalGroup(1, [1, 2, 6, 12, 13], tag=10)
     gmsh.model.setPhysicalName(1, outside_inconel, "outside_inconel")
 
-    left_symmetry = gmsh.model.addPhysicalGroup(1, [5, 17, 22], tag=11)
-    gmsh.model.setPhysicalName(1, left_symmetry, "left_symmetry")
+    left_symmetry_liquid = gmsh.model.addPhysicalGroup(1, [17], tag=21)
+    gmsh.model.setPhysicalName(1, left_symmetry_liquid, "left_symmetry_liquid")
 
-    top_cap_bc = gmsh.model.addPhysicalGroup(1, [11], tag=12)
+    left_symmetry_inconel = gmsh.model.addPhysicalGroup(1, [5], tag=22)
+    gmsh.model.setPhysicalName(1, left_symmetry_inconel, "left_symmetry_inconel")
+
+    top_cap_bc = gmsh.model.addPhysicalGroup(1, [11], tag=11)
     gmsh.model.setPhysicalName(1, top_cap_bc, "top_cap_bc")
 
-    gap_sidewall_bc = gmsh.model.addPhysicalGroup(1, [8], tag=13)
+    gap_sidewall_bc = gmsh.model.addPhysicalGroup(1, [8], tag=12)
     gmsh.model.setPhysicalName(1, gap_sidewall_bc, "gap_sidewall_bc")
 
-    liquid_surface_bc = gmsh.model.addPhysicalGroup(1, [18], tag=14)
+    liquid_surface_bc = gmsh.model.addPhysicalGroup(1, [18], tag=13)
     gmsh.model.setPhysicalName(1, liquid_surface_bc, "liquid_surface_bc")
 
-    heater_cap_bc = gmsh.model.addPhysicalGroup(1, [14], tag=16)
+    heater_cap_bc = gmsh.model.addPhysicalGroup(1, [14], tag=14)
     gmsh.model.setPhysicalName(1, heater_cap_bc, "heater_cap_bc")
 
-    heater_gap_bc = gmsh.model.addPhysicalGroup(1, [20], tag=17)
-    gmsh.model.setPhysicalName(1, heater_gap_bc, "heater_gap_bc")
+    # heater_gap_bc = gmsh.model.addPhysicalGroup(1, [20], tag=15)
+    # gmsh.model.setPhysicalName(1, heater_gap_bc, "heater_gap_bc")
+
+    liquid_heater_interface_bc = gmsh.model.addPhysicalGroup(1, [16, 19], tag=16)
+    gmsh.model.setPhysicalName(
+        1, liquid_heater_interface_bc, "liquid_heater_interface_bc"
+    )
 
     boundary_liquid = set(
         gmsh.model.getBoundary(
@@ -220,27 +231,27 @@ def generate_baby_upper_2d_mesh(
             recursive=False,
         )
     )
-    boundary_heater = set(
-        gmsh.model.getBoundary(
-            [(2, tag) for tag in physical_surfaces["heater"]],
-            oriented=False,
-            recursive=False,
-        )
-    )
+    # boundary_heater = set(
+    #     gmsh.model.getBoundary(
+    #         [(2, tag) for tag in physical_surfaces["heater"]],
+    #         oriented=False,
+    #         recursive=False,
+    #     )
+    # )
 
     liquid_inconel_interface_curve = list(
         boundary_liquid.intersection(boundary_inconel)
     )
-    liquid_heater_interface_curve = list(boundary_liquid.intersection(boundary_heater))
+    # liquid_heater_interface_curve = list(boundary_liquid.intersection(boundary_heater))
 
     curve_tags_1 = [c[1] for c in liquid_inconel_interface_curve]
-    curve_tags_2 = [c[1] for c in liquid_heater_interface_curve]
+    # curve_tags_2 = [c[1] for c in liquid_heater_interface_curve]
 
     liquid_inconel_interface = gmsh.model.addPhysicalGroup(1, curve_tags_1, tag=99)
     gmsh.model.setPhysicalName(1, liquid_inconel_interface, "liquid_inconel_interface")
 
-    liquid_heater_interface = gmsh.model.addPhysicalGroup(1, curve_tags_2, tag=100)
-    gmsh.model.setPhysicalName(1, liquid_heater_interface, "liquid_heater_interface")
+    # liquid_heater_interface = gmsh.model.addPhysicalGroup(1, curve_tags_2, tag=100)
+    # gmsh.model.setPhysicalName(1, liquid_heater_interface, "liquid_heater_interface")
     gmsh.model.occ.synchronize()
 
     # =========================================================
