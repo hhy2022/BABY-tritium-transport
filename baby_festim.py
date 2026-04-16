@@ -113,7 +113,7 @@ htm_S_flibe = htm.solubilities.filter(material="flibe").filter(author="calderoni
 
 flibe_D_0 = htm_D_flibe[0].pre_exp.magnitude
 flibe_E_D = htm_D_flibe[0].act_energy.magnitude
-flibe_S_0 = htm_S_flibe[0].pre_exp.magnitude * 30  # empirical calibration factor
+flibe_S_0 = htm_S_flibe[0].pre_exp.magnitude
 flibe_E_S = htm_S_flibe[0].act_energy.magnitude
 
 # --- Inconel 625 ---
@@ -138,25 +138,29 @@ h = 0.001  # mesh size at interface (your mesh_size=0.001)
 
 # FLiBe
 D_flibe = flibe_D_0 * np.exp(-flibe_E_D / (8.617e-5 * T))
-K_flibe = flibe_S_0 * 30 * np.exp(-flibe_E_S / (8.617e-5 * T))
+K_flibe = flibe_S_0 * np.exp(-flibe_E_S / (8.617e-5 * T))
 
 # Inconel
 D_inconel = inconel_D_0 * np.exp(-inconel_E_D / (8.617e-5 * T))
 K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * T))
 
-print(f"D_flibe * K_flibe / h = {D_flibe * K_flibe / h:.2e}")
-print(f"D_inconel * K_inconel / h = {D_inconel * K_inconel / h:.2e}")
+print(
+    f"Estimated diffusivity at interface: D_flibe={D_flibe:.2e} m^2/s, D_inconel={D_inconel:.2e} m^2/s"
+)
+print(
+    f"Estimated solubility at interface: K_flibe={K_flibe:.2e} H/m^3/Pa^0.5, K_inconel={K_inconel:.2e} H/m^3/Pa^0.5"
+)
+exit()
 
-# penalty_factor = 100  # safety factor to ensure stability
-# penalty = penalty_factor * max(D_flibe * K_flibe / h, D_inconel * K_inconel / h)
+# # penalty_factor = 100  # safety factor to ensure stability
+# # penalty = penalty_factor * max(D_flibe * K_flibe / h, D_inconel * K_inconel / h)
 
-penalty = 1e17
+penalty = 1e21
+
 
 # ---------------------------------------------------------------------------
 # Tritium source term: constant during irradiation, zero afterwards
 # ---------------------------------------------------------------------------
-
-
 def tritium_source(t):
     """Tritium production rate [H/m^3/s]: constant during irradiation, zero afterwards."""
     return 2.19e8 if t < irradiation_time else 0.0
@@ -270,18 +274,18 @@ def build_model(results_folder: str = "results/baby_2d"):
             species=T,
             value=0.0,
         ),
-        # heater cap is assumed to be zero flux for now
-        F.ParticleFluxBC(
-            subdomain=heater_cap_bc,
-            species=T,
-            value=0,
-        ),
-        # heater-liquid interface is assumed to be zero flux for now
-        F.ParticleFluxBC(
-            subdomain=liquid_heater_interface,
-            species=T,
-            value=0,
-        ),
+        # # heater cap is assumed to be zero flux for now
+        # F.ParticleFluxBC(
+        #     subdomain=heater_cap_bc,
+        #     species=T,
+        #     value=0,
+        # ),
+        # # heater-liquid interface is assumed to be zero flux for now
+        # F.ParticleFluxBC(
+        #     subdomain=liquid_heater_interface,
+        #     species=T,
+        #     value=0,
+        # ),
     ]
 
     # --- Temperature (uniform, 650 degC) ---
@@ -289,8 +293,8 @@ def build_model(results_folder: str = "results/baby_2d"):
 
     # --- Time stepping ---
     dt = F.Stepsize(
-        initial_value=100,
-        growth_factor=1.1,
+        initial_value=10,  # seconds
+        growth_factor=1.05,
         cutback_factor=0.9,
         target_nb_iterations=4,
         milestones=[irradiation_time],
@@ -299,8 +303,8 @@ def build_model(results_folder: str = "results/baby_2d"):
     # --- Solver settings ---
     model.settings = F.Settings(
         transient=True,
-        atol=1e-12,
-        rtol=1e-12,
+        atol=1e-8,
+        rtol=1e-8,
         final_time=60 * 24 * 3600,  # 60 days in seconds
         stepsize=dt,
     )
@@ -380,7 +384,7 @@ if __name__ == "__main__":
 
     os.makedirs("results/baby_2d", exist_ok=True)
 
-    set_log_level(LogLevel.INFO)
+    # set_log_level(LogLevel.INFO)
 
     model = build_model(results_folder="results/baby_2d")  # change folder as needed
     model.initialise()
