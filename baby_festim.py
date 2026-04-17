@@ -389,16 +389,16 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
         gap_sidewall,
     ]
 
-    recomb_bcs = [
-        F.ParticleFluxBC(
+    recomb_bcs = []
+    for surf in outer_inconel_surfaces:
+        bc = F.ParticleFluxBC(
             value=recombination_flux,
             subdomain=surf,
             species_dependent_value={"c": T},
             species=T,
-            volume_subdomain=vol_inconel,
         )
-        for surf in outer_inconel_surfaces
-    ]
+        bc._volume_subdomain = vol_inconel
+        recomb_bcs.append(bc)
 
     model.boundary_conditions = [
         # CLLiF free surface: fixed zero concentration (tritium released to atmosphere)
@@ -428,8 +428,8 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
         transient=True,
         atol=1e-8,
         rtol=1e-8,
-        final_time=60 * 24 * 3600,  # 60 days in seconds
-        # final_time=10,  # 60 days in seconds
+        # final_time=60 * 24 * 3600,  # 60 days in seconds
+        final_time=20,  # 60 days in seconds
         stepsize=dt,
     )
 
@@ -532,9 +532,9 @@ if __name__ == "__main__":
     del model
     gc.collect()
 
-    model = build_model(sweep_gas="H2")
-    model.initialise()
-    model.run()
+    # model = build_model(sweep_gas="H2")
+    # model.initialise()
+    # model.run()
 
-    del model
-    gc.collect()
+    # del model
+    # gc.collect()
