@@ -7,6 +7,8 @@ from dolfinx import fem
 from dolfinx.io import gmsh as gmshio
 from dolfinx.log import LogLevel, set_log_level
 from mpi4py import MPI
+import os
+import gc
 
 # ---------------------------------------------------------------------------
 # Physical-group ID constants
@@ -144,13 +146,13 @@ K_flibe = flibe_S_0 * np.exp(-flibe_E_S / (8.617e-5 * T))
 D_inconel = inconel_D_0 * np.exp(-inconel_E_D / (8.617e-5 * T))
 K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * T))
 
-print(
-    f"Estimated diffusivity at interface: D_flibe={D_flibe:.2e} m^2/s, D_inconel={D_inconel:.2e} m^2/s"
-)
-print(
-    f"Estimated solubility at interface: K_flibe={K_flibe:.2e} H/m^3/Pa^0.5, K_inconel={K_inconel:.2e} H/m^3/Pa^0.5"
-)
-exit()
+# print(
+#     f"Estimated diffusivity at interface: D_flibe={D_flibe:.2e} m^2/s, D_inconel={D_inconel:.2e} m^2/s"
+# )
+# print(
+#     f"Estimated solubility at interface: K_flibe={K_flibe:.2e} H/m^3/Pa^0.5, K_inconel={K_inconel:.2e} H/m^3/Pa^0.5"
+# )
+# exit()
 
 # # penalty_factor = 100  # safety factor to ensure stability
 # # penalty = penalty_factor * max(D_flibe * K_flibe / h, D_inconel * K_inconel / h)
@@ -191,7 +193,7 @@ def build_model(results_folder: str = "results/baby_2d"):
         E_D=flibe_E_D,
         K_S_0=flibe_S_0,
         E_K_S=flibe_E_S,
-        solubility_law="sievert",
+        solubility_law="henry",
     )
     mat_inconel = F.Material(
         D_0=inconel_D_0,
@@ -294,10 +296,10 @@ def build_model(results_folder: str = "results/baby_2d"):
     # --- Time stepping ---
     dt = F.Stepsize(
         initial_value=10,  # seconds
-        growth_factor=1.05,
-        cutback_factor=0.9,
-        target_nb_iterations=4,
-        milestones=[irradiation_time],
+        # growth_factor=1.1,
+        # cutback_factor=0.9,
+        # target_nb_iterations=4,
+        # milestones=[irradiation_time],
     )
 
     # --- Solver settings ---
@@ -306,6 +308,7 @@ def build_model(results_folder: str = "results/baby_2d"):
         atol=1e-8,
         rtol=1e-8,
         final_time=60 * 24 * 3600,  # 60 days in seconds
+        # final_time=10,  # 60 days in seconds
         stepsize=dt,
     )
 
@@ -380,8 +383,6 @@ def build_model(results_folder: str = "results/baby_2d"):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import os
-
     os.makedirs("results/baby_2d", exist_ok=True)
 
     # set_log_level(LogLevel.INFO)
@@ -389,3 +390,6 @@ if __name__ == "__main__":
     model = build_model(results_folder="results/baby_2d")  # change folder as needed
     model.initialise()
     model.run()
+
+    del model
+    gc.collect()
