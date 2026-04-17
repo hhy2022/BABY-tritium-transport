@@ -52,13 +52,15 @@ class CylindricalSurfaceFlux(F.SurfaceFlux):
 
     azimuth_range: tuple = (0.0, 2 * np.pi)
 
-    def __init__(self, field, surface, filename, volume_subdomain):
+    def __init__(self, field, surface, filename, volume_subdomain, name=None):
         super().__init__(field=field, surface=surface, filename=filename)
         self.volume_subdomain = volume_subdomain
+        self._name = name  # optional label for the flux (e.g. "liquid surface", "Inconel top cap", etc.)
 
     @property
     def title(self):
-        return f"{self.field.name} cylindrical flux surface {self.surface.id}"
+        label = self._name if self._name else f"surface {self.surface.id}"
+        return f"{self.field.name} flux {label}"
 
     def compute(self, u, ds, entity_maps):
         from scifem import assemble_scalar
@@ -108,16 +110,19 @@ class CylindricalSurfaceFluxFromEquation(F.SurfaceFlux):
         inconel_Kr_0,
         inconel_E_Kr,
         temperature,
+        name=None,
     ):
         super().__init__(field=field, surface=surface, filename=filename)
         self.volume_subdomain = volume_subdomain
         self.inconel_Kr_0 = inconel_Kr_0
         self.inconel_E_Kr = inconel_E_Kr
         self.temperature = temperature  # scalar [K]
+        self._name = name
 
     @property
     def title(self):
-        return f"{self.field.name} recomb-eq flux surface {self.surface.id}"
+        label = self._name if self._name else f"surface {self.surface.id}"
+        return f"{self.field.name} recomb-eq flux {label}"
 
     def compute(self, u, ds, entity_maps):
         from scifem import assemble_scalar
@@ -447,72 +452,80 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
             subdomain=vol_inconel,
         ),
         # # Surface fluxes computed from -D grad(c) . n * r (cylindrical)
-        # CylindricalSurfaceFlux(
-        #     field=T,
-        #     surface=liquid_surface,
-        #     filename=f"{subfolder}/flux_liquid_surface.csv",
-        #     volume_subdomain=vol_cllif,
-        # ),
-        # CylindricalSurfaceFlux(
-        #     field=T,
-        #     surface=top_cap,
-        #     filename=f"{subfolder}/flux_inconel_top_cap.csv",
-        #     volume_subdomain=vol_inconel,
-        # ),
-        # CylindricalSurfaceFlux(
-        #     field=T,
-        #     surface=gap_sidewall,
-        #     filename=f"{subfolder}/flux_gap_sidewall.csv",
-        #     volume_subdomain=vol_inconel,
-        # ),
-        # CylindricalSurfaceFlux(
-        #     field=T,
-        #     surface=inconel_outer_bottom,
-        #     filename=f"{subfolder}/flux_inconel_outer_bottom.csv",
-        #     volume_subdomain=vol_inconel,
-        # ),
-        # CylindricalSurfaceFlux(
-        #     field=T,
-        #     surface=inconel_outer_side,
-        #     filename=f"{subfolder}/flux_inconel_outer_side.csv",
-        #     volume_subdomain=vol_inconel,
-        # ),
-        # CylindricalSurfaceFlux(
-        #     field=T,
-        #     surface=inconel_outer_top,
-        #     filename=f"{subfolder}/flux_inconel_outer_top.csv",
-        #     volume_subdomain=vol_inconel,
-        # ),
-        # # Recombination-equation fluxes computed from -Kr * c^2 * r (cylindrical)
-        # CylindricalSurfaceFluxFromEquation(
-        #     field=T,
-        #     surface=inconel_outer_bottom,
-        #     filename=f"{subfolder}/flux_inconel_outer_bottom_recomb_eq.csv",
-        #     volume_subdomain=vol_inconel,
-        #     inconel_Kr_0=inconel_Kr_0,
-        #     inconel_E_Kr=inconel_E_Kr,
-        #     temperature=temperature_K,
-        # ),
-        # CylindricalSurfaceFluxFromEquation(
-        #     field=T,
-        #     surface=inconel_outer_side,
-        #     filename=f"{subfolder}/flux_inconel_outer_side_recomb_eq.csv",
-        #     volume_subdomain=vol_inconel,
-        #     inconel_Kr_0=inconel_Kr_0,
-        #     inconel_E_Kr=inconel_E_Kr,
-        #     temperature=temperature_K,
-        # ),
-        # # Tritium inventory per volume region
-        # F.TotalVolume(
-        #     field=T,
-        #     volume=vol_cllif,
-        #     filename=f"{subfolder}/inventory_cllif.csv",
-        # ),
-        # F.TotalVolume(
-        #     field=T,
-        #     volume=vol_inconel,
-        #     filename=f"{subfolder}/inventory_inconel.csv",
-        # ),
+        CylindricalSurfaceFlux(
+            field=T,
+            surface=liquid_surface,
+            filename=f"{subfolder}/flux_liquid_surface.csv",
+            volume_subdomain=vol_cllif,
+            name="liquid surface",
+        ),
+        CylindricalSurfaceFlux(
+            field=T,
+            surface=top_cap,
+            filename=f"{subfolder}/flux_inconel_top_cap.csv",
+            volume_subdomain=vol_inconel,
+            name="Inconel top cap",
+        ),
+        CylindricalSurfaceFlux(
+            field=T,
+            surface=gap_sidewall,
+            filename=f"{subfolder}/flux_gap_sidewall.csv",
+            volume_subdomain=vol_inconel,
+            name="Inconel gap sidewall",
+        ),
+        CylindricalSurfaceFlux(
+            field=T,
+            surface=inconel_outer_bottom,
+            filename=f"{subfolder}/flux_inconel_outer_bottom.csv",
+            volume_subdomain=vol_inconel,
+            name="Inconel outer bottom",
+        ),
+        CylindricalSurfaceFlux(
+            field=T,
+            surface=inconel_outer_side,
+            filename=f"{subfolder}/flux_inconel_outer_side.csv",
+            volume_subdomain=vol_inconel,
+            name="Inconel outer side",
+        ),
+        CylindricalSurfaceFlux(
+            field=T,
+            surface=inconel_outer_top,
+            filename=f"{subfolder}/flux_inconel_outer_top.csv",
+            volume_subdomain=vol_inconel,
+            name="Inconel outer top",
+        ),
+        # Recombination-equation fluxes computed from -Kr * c^2 * r (cylindrical)
+        CylindricalSurfaceFluxFromEquation(
+            field=T,
+            surface=inconel_outer_bottom,
+            filename=f"{subfolder}/flux_inconel_outer_bottom_recomb_eq.csv",
+            volume_subdomain=vol_inconel,
+            inconel_Kr_0=inconel_Kr_0,
+            inconel_E_Kr=inconel_E_Kr,
+            temperature=temperature_K,
+            name="Inconel outer bottom",
+        ),
+        CylindricalSurfaceFluxFromEquation(
+            field=T,
+            surface=inconel_outer_side,
+            filename=f"{subfolder}/flux_inconel_outer_side_recomb_eq.csv",
+            volume_subdomain=vol_inconel,
+            inconel_Kr_0=inconel_Kr_0,
+            inconel_E_Kr=inconel_E_Kr,
+            temperature=temperature_K,
+            name="Inconel outer side",
+        ),
+        # Tritium inventory per volume region
+        F.TotalVolume(
+            field=T,
+            volume=vol_cllif,
+            filename=f"{subfolder}/inventory_cllif.csv",
+        ),
+        F.TotalVolume(
+            field=T,
+            volume=vol_inconel,
+            filename=f"{subfolder}/inventory_inconel.csv",
+        ),
     ]
 
     return model
@@ -528,6 +541,10 @@ if __name__ == "__main__":
     model = build_model(sweep_gas="He")
     model.initialise()
     model.run()
+
+    for export in model.exports:
+        if hasattr(export, "data") and len(export.data) > 0:
+            print(f"{export.title}: {export.data[-1]:.3e}")
 
     del model
     gc.collect()
