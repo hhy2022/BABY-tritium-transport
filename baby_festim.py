@@ -434,7 +434,7 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
         atol=1e-8,
         rtol=1e-8,
         # final_time=60 * 24 * 3600,  # 60 days in seconds
-        final_time=20,  # 60 days in seconds
+        final_time=24 * 3600,
         stepsize=dt,
     )
 
@@ -552,6 +552,10 @@ if __name__ == "__main__":
     # model = build_model(sweep_gas="H2")
     # model.initialise()
     # model.run()
+
+    # for export in model.exports:
+    #     if hasattr(export, "data") and len(export.data) > 0:
+    #         print(f"{export.title}: {export.data[-1]:.3e}")
 
     # del model
     # gc.collect()
