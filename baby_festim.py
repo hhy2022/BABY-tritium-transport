@@ -225,6 +225,8 @@ K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
 # # penalty = penalty_factor * max(D_flibe * K_flibe / h, D_inconel * K_inconel / h)
 
 penalty = 1e21
+atol = 1e-8
+rtol = 1e-8
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +235,7 @@ penalty = 1e21
 def tritium_source(t):
     """Tritium production rate [H/m^3/s]: constant during irradiation, zero afterwards."""
     return 2.19e8 if t < irradiation_time else 0.0
+    # return 10
 
 
 # ---------------------------------------------------------------------------
@@ -405,13 +408,18 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
         bc._volume_subdomain = vol_inconel
         recomb_bcs.append(bc)
 
+    inner_vessel_surfaces = [liquid_surface, gap_sidewall, top_cap]
+
     model.boundary_conditions = [
-        # CLLiF free surface: fixed zero concentration (tritium released to atmosphere)
-        F.FixedConcentrationBC(
-            subdomain=liquid_surface,
-            species=T,
-            value=0.0,
-        ),
+        # Fixed zero concentration on all inner vessel surfaces (tritium released to gap)
+        *[
+            F.FixedConcentrationBC(
+                subdomain=surf,
+                species=T,
+                value=0.0,
+            )
+            for surf in inner_vessel_surfaces
+        ],
         # Recombination BCs on all Inconel outer surfaces
         *recomb_bcs,
     ]
@@ -422,17 +430,17 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
     # --- Time stepping ---
     dt = F.Stepsize(
         initial_value=10,  # seconds
-        # growth_factor=1.1,
-        # cutback_factor=0.9,
-        # target_nb_iterations=4,
-        # milestones=[irradiation_time],
+        growth_factor=1.1,
+        cutback_factor=0.9,
+        target_nb_iterations=4,
+        milestones=[irradiation_time],
     )
 
     # --- Solver settings ---
     model.settings = F.Settings(
         transient=True,
-        atol=1e-8,
-        rtol=1e-8,
+        atol=atol,
+        rtol=rtol,
         # final_time=60 * 24 * 3600,  # 60 days in seconds
         final_time=24 * 3600,
         stepsize=dt,
@@ -549,13 +557,13 @@ if __name__ == "__main__":
     del model
     gc.collect()
 
-    # model = build_model(sweep_gas="H2")
-    # model.initialise()
-    # model.run()
+    model = build_model(sweep_gas="H2")
+    model.initialise()
+    model.run()
 
-    # for export in model.exports:
-    #     if hasattr(export, "data") and len(export.data) > 0:
-    #         print(f"{export.title}: {export.data[-1]:.3e}")
+    for export in model.exports:
+        if hasattr(export, "data") and len(export.data) > 0:
+            print(f"{export.title}: {export.data[-1]:.3e}")
 
-    # del model
-    # gc.collect()
+    del model
+    gc.collect()
