@@ -224,7 +224,7 @@ K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
 # # penalty_factor = 100  # safety factor to ensure stability
 # # penalty = penalty_factor * max(D_flibe * K_flibe / h, D_inconel * K_inconel / h)
 
-penalty = 1e21
+penalty = 1e37
 atol = 1e-8
 rtol = 1e-8
 
@@ -442,7 +442,7 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
         atol=atol,
         rtol=rtol,
         # final_time=60 * 24 * 3600,  # 60 days in seconds
-        final_time=24 * 3600,
+        final_time=100,
         stepsize=dt,
     )
 
@@ -536,7 +536,7 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
         ),
     ]
 
-    return model
+    return model, T, vol_cllif, vol_inconel
 
 
 # ---------------------------------------------------------------------------
@@ -546,24 +546,54 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
 
 if __name__ == "__main__":
     # set_log_level(LogLevel.INFO)
-    model = build_model(sweep_gas="He")
+    model, T, vol_cllif, vol_inconel = build_model(sweep_gas="He")
     model.initialise()
     model.run()
 
-    for export in model.exports:
-        if hasattr(export, "data") and len(export.data) > 0:
-            print(f"{export.title}: {export.data[-1]:.3e}")
+    from dolfinx import geometry
+    import numpy as np
+
+    u_flibe = T.subdomain_to_post_processing_solution[vol_cllif]
+    u_inconel = T.subdomain_to_post_processing_solution[vol_inconel]
+
+    r_iface = 0.07
+    z_test = 0.0558
+
+    mesh_flibe = vol_cllif.submesh
+    mesh_inconel = vol_inconel.submesh
+
+    bb_tree_flibe = geometry.bb_tree(mesh_flibe, mesh_flibe.topology.dim)
+    bb_tree_inconel = geometry.bb_tree(mesh_inconel, mesh_inconel.topology.dim)
+
+    def eval_at(u, bb_tree, mesh, r, z):
+        pt = np.array([[r, z, 0.0]])
+        candidates = geometry.compute_collisions_points(bb_tree, pt)
+        cells = geometry.compute_colliding_cells(mesh, candidates, pt)
+        return u.eval(pt, np.array([cells.links(0)[0]]))[0]
+
+    c_l = eval_at(u_flibe, bb_tree_flibe, mesh_flibe, r_iface, z_test)
+    c_r = eval_at(u_inconel, bb_tree_inconel, mesh_inconel, r_iface, z_test)
+
+    print(f"c_flibe          = {c_l}")
+    print(f"c_inconel        = {c_r}")
+    print(f"c_henry/K_H      = {c_l / K_flibe}")
+    print(f"(c_sievert/K_S)^2 = {(c_r / K_inconel) ** 2}")
+    print(f"henry ratio            = {(c_l / K_flibe) / (c_r / K_inconel) ** 2:.4e}")
+
+    # for export in model.exports:
+    #     if hasattr(export, "data") and len(export.data) > 0:
+    #         print(f"{export.title}: {export.data[-1]:.3e}")
 
     del model
     gc.collect()
 
-    model = build_model(sweep_gas="H2")
-    model.initialise()
-    model.run()
+    # model, T, vol_cllif, vol_inconel = build_model(sweep_gas="H2")
+    # model.initialise()
+    # model.run()
 
-    for export in model.exports:
-        if hasattr(export, "data") and len(export.data) > 0:
-            print(f"{export.title}: {export.data[-1]:.3e}")
+    # for export in model.exports:
+    #     if hasattr(export, "data") and len(export.data) > 0:
+    #         print(f"{export.title}: {export.data[-1]:.3e}")
 
-    del model
-    gc.collect()
+    # del model
+    # gc.collect()
