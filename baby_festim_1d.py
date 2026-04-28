@@ -9,13 +9,12 @@ Geometry (x-axis):
 Boundary conditions:
     x = 0          : c = 0  (tritium released to gap / free surface)
     x = L_liquid   : discontinuous interface (CLLiF <-> Inconel)
-                     henry law (CLLiF) | sievert law (Inconel)
     x = L_liquid + L_solid : selectable via right_bc argument:
                      "zero_flux"     — default Neumann (no action)
                      "dirichlet"     — fixed c = 0
-                     "recomb_he"     — J = -Kr * c²          (He sweep gas)
-                     "recomb_h2"     — J = -Kr * c² - Kr * c_H2 * c  (H2 sweep gas)
-                     "recomb_large"  — Kr x 1e48 (Kr → ∞ limit test)
+                     "recomb_he"     — J = -Kr * c²
+                     "recomb_h2"     — J = -Kr * c² - Kr * c_H2 * c
+                     "recomb_large"  — Kr x 1e48
 """
 
 import numpy as np
@@ -23,6 +22,7 @@ import festim as F
 import h_transport_materials as htm
 import requests
 import ufl
+from dolfinx import fem
 import os
 import gc
 import pandas as pd
@@ -31,8 +31,8 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
-L_liquid = 0.07  # m  CLLiF melt thickness
-L_solid = 0.003  # m  Inconel 625 wall thickness
+L_liquid = 0.07
+L_solid = 0.003
 
 ID_LIQUID = 1
 ID_SOLID = 2
@@ -66,7 +66,7 @@ inconel_E_Kr = htm_Kr_inconel[1].act_energy.magnitude
 # ---------------------------------------------------------------------------
 # Temperature
 # ---------------------------------------------------------------------------
-temperature_K = 650 + 273.15  # K
+temperature_K = 650 + 273.15
 
 D_fl = flibe_D_0 * np.exp(-flibe_E_D / (F.k_B * temperature_K))
 K_fl = flibe_S_0 * np.exp(-flibe_E_S / (F.k_B * temperature_K))
@@ -84,11 +84,11 @@ rtol = 1e-10
 # ---------------------------------------------------------------------------
 # H2 sweep gas concentration
 # ---------------------------------------------------------------------------
-h2_P_gauge = 3  # psi gauge
-h2_conc_ppm = 1000  # ppm H2
-P_atm = 14.7  # psi
-P_h2 = (h2_conc_ppm / 1e6) * (h2_P_gauge + P_atm) * 6894.76  # Pa
-h2_conc = (P_h2 / (8.314 * 298)) * Na  # H/m³
+h2_P_gauge = 3
+h2_conc_ppm = 1000
+P_atm = 14.7
+P_h2 = (h2_conc_ppm / 1e6) * (h2_P_gauge + P_atm) * 6894.76
+h2_conc = (P_h2 / (8.314 * 298)) * Na
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +111,6 @@ irradiation_time = get_total_irradiation_time()
 
 
 def tritium_source(t):
-    """Tritium production rate [H/m³/s]: constant during irradiation, zero afterwards."""
     return 2.19e8 if t < irradiation_time else 0.0
 
 
@@ -119,41 +118,77 @@ def tritium_source(t):
 # Recombination flux functions
 # ---------------------------------------------------------------------------
 def recomb_he(c, T):
-    """Pure He sweep gas: J = -Kr * c²"""
     Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
     return -Kr * c**2
 
 
 def recomb_h2(c, T):
-    """H2 sweep gas: J = -Kr * c² - Kr * c_H2 * c"""
     Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
     return -Kr * c**2 - Kr * h2_conc * c
 
 
 def recomb_large(c, T):
-    """Kr → ∞ limit test: Kr x 1e48"""
     Kr = inconel_Kr_0 * 1e48 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
     return -Kr * c**2
+
+
+# ---------------------------------------------------------------------------
+# Custom recomb-eq flux export — like the 2D version, computes
+#     J = (Kr * c^2 + Kr * c_H2 * c)   [H/m^2/s]
+# directly from the FE solution at the surface, without referencing
+# any analytical c value.
+# ---------------------------------------------------------------------------
+class RecombFluxExport(F.SurfaceFlux):
+    """Compute Kr * c^2 (+ Kr * c_H2 * c) on a 1D surface, evaluated by FESTIM."""
+
+    def __init__(
+        self,
+        field,
+        surface,
+        filename,
+        volume_subdomain,
+        Kr_0,
+        E_Kr,
+        temperature,
+        h2_conc=0.0,
+        kr_multiplier=1.0,
+    ):
+        super().__init__(field=field, surface=surface, filename=filename)
+        self.volume_subdomain = volume_subdomain
+        self.Kr_0 = Kr_0
+        self.E_Kr = E_Kr
+        self.temperature = temperature
+        self.h2_conc = h2_conc
+        self.kr_multiplier = kr_multiplier
+
+    def compute(self, u, ds, entity_maps):
+        from scifem import assemble_scalar
+
+        Kr = (
+            self.kr_multiplier
+            * self.Kr_0
+            * ufl.exp(-self.E_Kr / (F.k_B * self.temperature))
+        )
+
+        # Physical release: T+T -> T2, plus T+H -> HT (if H2 present)
+        integrand = Kr * u**2 + Kr * self.h2_conc * u
+
+        flux = assemble_scalar(
+            fem.form(
+                integrand * ds(self.surface.id),
+                entity_maps=entity_maps,
+            )
+        )
+        self.value = flux
+        self.data.append(self.value)
 
 
 # ---------------------------------------------------------------------------
 # Build model
 # ---------------------------------------------------------------------------
 def build_model(right_bc: str = "recomb_he", final_time: float = 1e5):
-    """
-    Build and return the FESTIM model.
-
-    Parameters
-    ----------
-    right_bc : str
-        Right boundary condition type. One of:
-        "zero_flux", "dirichlet", "recomb_he", "recomb_h2", "recomb_large"
-    final_time : float
-        Simulation end time [s].
-    """
     model = F.HydrogenTransportProblemDiscontinuous()
 
-    # Mesh
     vertices = np.unique(
         np.concatenate(
             [
@@ -164,7 +199,6 @@ def build_model(right_bc: str = "recomb_he", final_time: float = 1e5):
     )
     model.mesh = F.Mesh1D(vertices)
 
-    # Materials
     mat_cllif = F.Material(
         D_0=flibe_D_0,
         E_D=flibe_E_D,
@@ -180,7 +214,6 @@ def build_model(right_bc: str = "recomb_he", final_time: float = 1e5):
         solubility_law="sievert",
     )
 
-    # Subdomains
     vol_cllif = F.VolumeSubdomain1D(
         id=ID_LIQUID, borders=[0, L_liquid], material=mat_cllif
     )
@@ -198,16 +231,13 @@ def build_model(right_bc: str = "recomb_he", final_time: float = 1e5):
     model.interfaces = [iface]
     model.surface_to_volume = {surf_left: vol_cllif, surf_right: vol_inconel}
 
-    # Species
     T_sp = F.Species("T", mobile=True, subdomains=[vol_cllif, vol_inconel])
     model.species = [T_sp]
 
-    # Source
     model.sources = [
         F.ParticleSource(value=tritium_source, volume=vol_cllif, species=T_sp)
     ]
 
-    # Boundary conditions
     bc_list = [F.FixedConcentrationBC(subdomain=surf_left, species=T_sp, value=0.0)]
 
     flux_fn_map = {
@@ -217,7 +247,7 @@ def build_model(right_bc: str = "recomb_he", final_time: float = 1e5):
     }
 
     if right_bc == "zero_flux":
-        pass  # default Neumann: no action needed
+        pass
     elif right_bc == "dirichlet":
         bc_list.append(
             F.FixedConcentrationBC(subdomain=surf_right, species=T_sp, value=0.0)
@@ -232,14 +262,11 @@ def build_model(right_bc: str = "recomb_he", final_time: float = 1e5):
             )
         )
     else:
-        raise ValueError(
-            f"Unknown right_bc='{right_bc}'. Choose from: zero_flux, dirichlet, recomb_he, recomb_h2, recomb_large"
-        )
+        raise ValueError(f"Unknown right_bc='{right_bc}'.")
 
     model.boundary_conditions = bc_list
     model.temperature = temperature_K
 
-    # Time stepping
     model.settings = F.Settings(
         transient=True,
         atol=atol,
@@ -254,7 +281,18 @@ def build_model(right_bc: str = "recomb_he", final_time: float = 1e5):
         ),
     )
 
-    # Exports
+    # Match the recomb-eq export to whatever Kr the BC actually uses.
+    if right_bc == "recomb_h2":
+        h2_for_export = h2_conc
+        kr_mult = 1.0
+    elif right_bc == "recomb_large":
+        h2_for_export = 0.0
+        kr_mult = 1e48
+    else:
+        # zero_flux / dirichlet / recomb_he : standard Kr, no H2
+        h2_for_export = 0.0
+        kr_mult = 1.0
+
     os.makedirs(f"results_1d/{right_bc}", exist_ok=True)
     model.exports = [
         F.VTXSpeciesExport(
@@ -277,10 +315,23 @@ def build_model(right_bc: str = "recomb_he", final_time: float = 1e5):
             volume=vol_inconel,
             filename=f"results_1d/{right_bc}/inventory_inconel.csv",
         ),
+        # FESTIM native: -D grad(c) . n at the right surface
         F.SurfaceFlux(
             field=T_sp,
             surface=surf_right,
             filename=f"results_1d/{right_bc}/flux_outer_wall.csv",
+        ),
+        # Recomb-eq flux: directly evaluate Kr*c^2 (+ Kr*c_H2*c) on the boundary
+        RecombFluxExport(
+            field=T_sp,
+            surface=surf_right,
+            filename=f"results_1d/{right_bc}/flux_outer_wall_recomb_eq.csv",
+            volume_subdomain=vol_inconel,
+            Kr_0=inconel_Kr_0,
+            E_Kr=inconel_E_Kr,
+            temperature=temperature_K,
+            h2_conc=h2_for_export,
+            kr_multiplier=kr_mult,
         ),
     ]
 
@@ -288,57 +339,9 @@ def build_model(right_bc: str = "recomb_he", final_time: float = 1e5):
 
 
 # ---------------------------------------------------------------------------
-# Post-process
-# ---------------------------------------------------------------------------
-def post_process(model, T_sp, vol_cllif, vol_inconel, right_bc):
-    from dolfinx import geometry
-
-    u_fl = T_sp.subdomain_to_post_processing_solution[vol_cllif]
-    u_in = T_sp.subdomain_to_post_processing_solution[vol_inconel]
-
-    def eval_1d(u, subdomain, x_eval):
-        mesh = subdomain.submesh
-        bb = geometry.bb_tree(mesh, mesh.topology.dim)
-        pt = np.array([[x_eval, 0.0, 0.0]])
-        cands = geometry.compute_collisions_points(bb, pt)
-        cells = geometry.compute_colliding_cells(mesh, cands, pt)
-        return u.eval(pt, np.array([cells.links(0)[0]]))[0]
-
-    c_liq = eval_1d(u_fl, vol_cllif, L_liquid)
-    c_sol = eval_1d(u_in, vol_inconel, L_liquid)
-    c_wall = eval_1d(u_in, vol_inconel, L_liquid + L_solid)
-
-    # Interface check
-    print(f"\n=== Interface check ({right_bc}) ===")
-    print(f"  c_CLLiF   (x→L⁻) = {c_liq:.4e}  [H/m³]")
-    print(f"  c_Inconel (x→L⁺) = {c_sol:.4e}  [H/m³]")
-    print(f"  p_CLLiF   = c/K_H        = {c_liq / K_fl:.4e}  [Pa]")
-    print(f"  p_Inconel = (c/K_S)²     = {(c_sol / K_in) ** 2:.4e}  [Pa]")
-    print(
-        f"  henry check              = {(c_liq / K_fl) / (c_sol / K_in) ** 2:.4e}  (should be ~1)"
-    )
-
-    # Right boundary check
-    J_expected = -Kr_val * c_wall**2
-    flux_data = pd.read_csv(f"results_1d/{right_bc}/flux_outer_wall.csv")
-    J_festim = flux_data.iloc[-1, 1]
-
-    print(f"\n=== Right BC check ({right_bc}) ===")
-    print(f"  c_right_wall        = {c_wall:.4e}  [H/m³]")
-    print(f"  Kr(T)               = {Kr_val:.4e}")
-    print(f"  J_expected = -Kr*c² = {J_expected:.4e}  [H/m²/s]")
-    print(f"  J_festim            = {J_festim:.4e}  [H/m²/s]")
-    print(f"  J_festim        = {J_festim:.4e}  [H/m²/s]")
-    print(
-        f"  ratio (converted)   = {(J_festim * Na) / J_expected:.4e}  (should be ~-1 for recomb)"
-    )
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Run all cases and compare
     cases = ["zero_flux", "dirichlet", "recomb_he", "recomb_h2", "recomb_large"]
 
     for case in cases:
@@ -350,35 +353,93 @@ if __name__ == "__main__":
         model.initialise()
         model.run()
 
-        post_process(model, T_sp, vol_cllif, vol_inconel, right_bc=case)
-
         del model
         gc.collect()
 
 
 # ---------------------------------------------------------------------------
-# Plot: inventory CLLiF, inventory Inconel, flux outer wall
+# Plot: 4 panels — inventories + two flux versions side by side
 # ---------------------------------------------------------------------------
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+s_to_day = 1 / 3600 / 24
+t_irr_day = irradiation_time * s_to_day
 
-titles = ["Inventory CLLiF", "Inventory Inconel", "Flux outer wall"]
-files = ["inventory_cllif.csv", "inventory_inconel.csv", "flux_outer_wall.csv"]
-ylabels = ["Inventory [H/m²]", "Inventory [H/m²]", "Flux [mol/m²/s]"]
+case_styles = {
+    "zero_flux": dict(color="C0", linestyle="-", linewidth=2.0),
+    "recomb_he": dict(color="C1", linestyle="--", linewidth=2.2),
+    "recomb_h2": dict(color="C2", linestyle="-", linewidth=1.8),
+    "recomb_large": dict(color="C3", linestyle="-", linewidth=1.8),
+    "dirichlet": dict(color="C4", linestyle=":", linewidth=2.2),
+}
 
-for ax, fname, title, ylabel in zip(axes, files, titles, ylabels):
+fig, axes = plt.subplots(1, 3, figsize=(14, 10))
+
+panels = [
+    dict(
+        ax=axes[0, 0],
+        title="Inventory CLLiF",
+        file="inventory_cllif.csv",
+        ylabel="CLLiF inventory [H/m²]",
+        scale="log",
+    ),
+    dict(
+        ax=axes[0, 1],
+        title="Inventory Inconel",
+        file="inventory_inconel.csv",
+        ylabel="Inconel inventory [H/m²]",
+        scale="log",
+    ),
+    dict(
+        ax=axes[1, 0],
+        title="Outer-wall flux: FESTIM SurfaceFlux  ($-D\\,\\nabla c\\cdot n$)",
+        file="flux_outer_wall.csv",
+        ylabel="Flux [H/m²/s]",
+        scale="symlog",
+    ),
+    dict(
+        ax=axes[1, 1],
+        title=r"Outer-wall flux: recomb-eq  ($K_r c^2 + K_r c_{H_2} c$)",
+        file="flux_outer_wall_recomb_eq.csv",
+        ylabel="Flux [H/m²/s]",
+        scale="symlog",
+    ),
+]
+
+for panel in panels:
+    ax = panel["ax"]
     for case in cases:
-        fpath = f"results_1d/{case}/{fname}"
+        fpath = f"results_1d/{case}/{panel['file']}"
         if not os.path.exists(fpath):
             continue
         df = pd.read_csv(fpath)
-        t = df.iloc[:, 0]
-        y = df.iloc[:, 1]
-        ax.plot(t, y, label=case)
-    ax.set_xlabel("Time [s]")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.legend()
-    ax.grid(True)
+        t = df.iloc[:, 0].values * s_to_day
+        y = df.iloc[:, 1].values
+        ax.plot(t, y, label=case, **case_styles[case])
+
+    ax.axvline(t_irr_day, color="0.5", linewidth=0.8, linestyle=":")
+    # ax.text(
+    #     t_irr_day,
+    #     1.02,
+    #     "irradiation end",
+    #     transform=ax.get_xaxis_transform(),
+    #     ha="center",
+    #     va="bottom",
+    #     fontsize=8,
+    #     color="0.4",
+    # )
+
+    ax.set_xlabel("Time [days]")
+    ax.set_ylabel(panel["ylabel"])
+    ax.set_title(panel["title"], fontsize=10)
+    ax.set_xlim(left=0)
+
+    if panel["scale"] == "log":
+        ax.set_yscale("log")
+    elif panel["scale"] == "symlog":
+        ax.set_yscale("symlog", linthresh=1e-10)
+        ax.axhline(0, color="0.5", linewidth=0.5)
+
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(fontsize=8)
 
 plt.tight_layout()
 plt.savefig("results_1d/comparison.png", dpi=150)
