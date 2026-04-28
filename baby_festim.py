@@ -224,9 +224,9 @@ K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
 # # penalty_factor = 100  # safety factor to ensure stability
 # # penalty = penalty_factor * max(D_flibe * K_flibe / h, D_inconel * K_inconel / h)
 
-penalty = 1e37
-atol = 1e-8
-rtol = 1e-8
+penalty = 1e35
+atol = 1e-6
+rtol = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +440,7 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
         atol=atol,
         rtol=rtol,
         final_time=60 * 24 * 3600,  # 60 days in seconds
-        # final_time=100,
+        # final_time=12 * 3600,
         stepsize=dt,
     )
 
@@ -546,9 +546,9 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
 if __name__ == "__main__":
     # set_log_level(LogLevel.INFO)
     # model, T, vol_cllif, vol_inconel = build_model(sweep_gas="He")
-    model = build_model(sweep_gas="H2")
-    model.initialise()
-    model.run()
+    # model = build_model(sweep_gas="H2")
+    # model.initialise()
+    # model.run()
 
     # from dolfinx import geometry
     # import numpy as np
@@ -584,8 +584,8 @@ if __name__ == "__main__":
     #     if hasattr(export, "data") and len(export.data) > 0:
     #         print(f"{export.title}: {export.data[-1]:.3e}")
 
-    del model
-    gc.collect()
+    # del model
+    # gc.collect()
 
     # model, T, vol_cllif, vol_inconel = build_model(sweep_gas="H2")
     model = build_model(sweep_gas="H2")
