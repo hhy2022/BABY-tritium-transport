@@ -35,7 +35,6 @@ ID_INCONEL_OUTER_TOP = 33  # top face of Inconel cap (z=y_IV_top)
 
 # ---------------------------------------------------------------------------
 # Cylindrical surface flux: J = int(-D grad(c) . n * r dS)
-# The 2D mesh is an (r, z) cross-section; rotating it 2*pi recovers the full 3D flux.
 # ---------------------------------------------------------------------------
 
 
@@ -45,9 +44,6 @@ class CylindricalSurfaceFlux(F.SurfaceFlux):
 
     Computes:
         J = integral(-D * grad(c) . n * r  dS)
-
-    where r = x[0] is the radial coordinate and azimuth_range covers the full
-    revolution by default (0 to 2*pi).
     """
 
     azimuth_range: tuple = (0.0, 2 * np.pi)
@@ -55,7 +51,7 @@ class CylindricalSurfaceFlux(F.SurfaceFlux):
     def __init__(self, field, surface, filename, volume_subdomain, name=None):
         super().__init__(field=field, surface=surface, filename=filename)
         self.volume_subdomain = volume_subdomain
-        self._name = name  # optional label for the flux (e.g. "liquid surface", "Inconel top cap", etc.)
+        self._name = name
 
     @property
     def title(self):
@@ -72,7 +68,7 @@ class CylindricalSurfaceFlux(F.SurfaceFlux):
 
         n = ufl.FacetNormal(mesh)
         x = ufl.SpatialCoordinate(mesh)
-        r = x[0]  # radial coordinate
+        r = x[0]
 
         flux = assemble_scalar(
             fem.form(
@@ -87,16 +83,24 @@ class CylindricalSurfaceFlux(F.SurfaceFlux):
 
 
 # ---------------------------------------------------------------------------
-# surface flux computed from the recombination equation
+# Surface flux computed from the recombination equation.
+# This is the PHYSICAL release rate (always >= 0) and is the right quantity
+# to integrate for cumulative tritium release.
+#
+# He case:  J = Kr * c^2
+# H2 case:  J = Kr * c^2 + Kr * c_H2 * c
 # ---------------------------------------------------------------------------
 
 
 class CylindricalSurfaceFluxFromEquation(F.SurfaceFlux):
     """
-    Cylindrical surface flux computed from the recombination equation:
-        J = integral(-Kr * c^2 * r  dS) * 2*pi
+    Cylindrical surface flux computed from the recombination equation.
 
-    NOTE: valid only for the He case (no H2). For H2, extend the formula.
+    For sweep_gas == "He":
+        J = integral(Kr * c^2 * r  dS) * 2*pi
+
+    For sweep_gas == "H2":
+        J = integral( (Kr * c^2 + Kr * c_H2 * c) * r  dS) * 2*pi
     """
 
     azimuth_range: tuple = (0.0, 2 * np.pi)
@@ -110,13 +114,15 @@ class CylindricalSurfaceFluxFromEquation(F.SurfaceFlux):
         inconel_Kr_0,
         inconel_E_Kr,
         temperature,
+        h2_conc=0.0,  # H2 concentration [m^-3]; 0.0 for pure He case
         name=None,
     ):
         super().__init__(field=field, surface=surface, filename=filename)
         self.volume_subdomain = volume_subdomain
         self.inconel_Kr_0 = inconel_Kr_0
         self.inconel_E_Kr = inconel_E_Kr
-        self.temperature = temperature  # scalar [K]
+        self.temperature = temperature
+        self.h2_conc = h2_conc
         self._name = name
 
     @property
@@ -139,9 +145,13 @@ class CylindricalSurfaceFluxFromEquation(F.SurfaceFlux):
             -self.inconel_E_Kr / (F.k_B * self.temperature)
         )
 
+        # Physical release: T+T -> T2  plus  T+H -> HT (if H2 present)
+        # Both terms are non-negative since c >= 0 and h2_conc >= 0
+        integrand = Kr * u**2 + Kr * self.h2_conc * u
+
         flux = assemble_scalar(
             fem.form(
-                -Kr * u**2 * r * ds(self.surface.id),
+                integrand * r * ds(self.surface.id),
                 entity_maps=entity_maps,
             )
         )
@@ -152,12 +162,11 @@ class CylindricalSurfaceFluxFromEquation(F.SurfaceFlux):
 
 
 # ---------------------------------------------------------------------------
-# Fetch irradiation time from experimental data
+# Fetch irradiation time
 # ---------------------------------------------------------------------------
 
 
 def get_total_irradiation_time() -> float:
-    """Fetch total irradiation duration (seconds) from the experimental data repository."""
     from libra_toolbox.tritium.model import ureg
 
     url = "https://raw.githubusercontent.com/LIBRA-project/BABY-1L-run-1/refs/tags/v0.5/data/processed_data.json"
@@ -173,10 +182,9 @@ def get_total_irradiation_time() -> float:
 irradiation_time = get_total_irradiation_time()
 
 # ---------------------------------------------------------------------------
-# Material properties from h_transport_materials
+# Material properties
 # ---------------------------------------------------------------------------
 
-# --- FLiBe (CLLiF) ---
 htm_D_flibe = htm.diffusivities.filter(material="flibe").filter(author="calderoni")
 htm_S_flibe = htm.solubilities.filter(material="flibe").filter(author="calderoni")
 
@@ -185,7 +193,6 @@ flibe_E_D = htm_D_flibe[0].act_energy.magnitude
 flibe_S_0 = htm_S_flibe[0].pre_exp.magnitude
 flibe_E_S = htm_S_flibe[0].act_energy.magnitude
 
-# --- Inconel 625 ---
 htm_D_inconel = htm.diffusivities.filter(material="inconel_625")
 htm_S_inconel = htm.solubilities.filter(material="inconel_625")
 htm_recomb_inconel = htm.recombination_coeffs.filter(material="inconel_625")
@@ -199,43 +206,45 @@ inconel_Kr_0 = htm_recomb_inconel[1].pre_exp.magnitude
 inconel_E_Kr = htm_recomb_inconel[1].act_energy.magnitude
 
 # -------------------------------------------------------------------
-# estimate the penalty term for the CLLiF-Inconel interface based on the diffusivity and mesh size
+# Penalty term + solver tolerances
 # -------------------------------------------------------------------
 
-temperature_K = 650 + 273.15  # uniform temperature [K]
-h = 0.001  # mesh size at interface (your mesh_size=0.001)
+temperature_K = 650 + 273.15
+h = 0.001
 
-# FLiBe
-D_flibe = flibe_D_0 * np.exp(-flibe_E_D / (8.617e-5 * temperature_K))
-K_flibe = flibe_S_0 * np.exp(-flibe_E_S / (8.617e-5 * temperature_K))
-
-# Inconel
-D_inconel = inconel_D_0 * np.exp(-inconel_E_D / (8.617e-5 * temperature_K))
-K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
-
-# print(
-#     f"Estimated diffusivity at interface: D_flibe={D_flibe:.2e} m^2/s, D_inconel={D_inconel:.2e} m^2/s"
-# )
-# print(
-#     f"Estimated solubility at interface: K_flibe={K_flibe:.2e} H/m^3/Pa^0.5, K_inconel={K_inconel:.2e} H/m^3/Pa^0.5"
-# )
-# exit()
-
-# # penalty_factor = 100  # safety factor to ensure stability
-# # penalty = penalty_factor * max(D_flibe * K_flibe / h, D_inconel * K_inconel / h)
+# D_flibe = flibe_D_0 * np.exp(-flibe_E_D / (8.617e-5 * temperature_K))
+# K_flibe = flibe_S_0 * np.exp(-flibe_E_S / (8.617e-5 * temperature_K))
+# D_inconel = inconel_D_0 * np.exp(-inconel_E_D / (8.617e-5 * temperature_K))
+# K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
 
 penalty = 1e31
 atol = 1e-6
 rtol = 1e-6
 
 
-# ---------------------------------------------------------------------------
-# Tritium source term: constant during irradiation, zero afterwards
-# ---------------------------------------------------------------------------
 def tritium_source(t):
-    """Tritium production rate [H/m^3/s]: constant during irradiation, zero afterwards."""
     return 2.19e8 if t < irradiation_time else 0.0
-    # return 10
+
+
+# ---------------------------------------------------------------------------
+# H2 sweep gas concentration (used by both BC and recomb-eq flux)
+# ---------------------------------------------------------------------------
+
+
+def compute_h2_conc():
+    """Compute H2 number density in the sweep gas [m^-3]."""
+    h2_P_gauge = 3  # psi (gauge)
+    h2_conc_ppm = 1000  # ppm H2 in sweep gas
+    mole_frac_h2 = h2_conc_ppm / 1e6
+    P_atm = 14.7
+    P_abs = h2_P_gauge + P_atm
+    P_h2 = mole_frac_h2 * P_abs
+    P_h2 *= 6894.76  # psi -> Pa
+    gas_constant = 8.314
+    T_room = 298
+    h2_conc_mol = P_h2 / (gas_constant * T_room)  # mol/m^3
+    h2_conc = h2_conc_mol * 6.022e23  # m^-3
+    return h2_conc
 
 
 # ---------------------------------------------------------------------------
@@ -247,15 +256,7 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
     """
     Build the 2D axisymmetric FESTIM model.
 
-    Parameters
-    ----------
-    sweep_gas : str
-        Sweep gas identifier. Accepted values:
-            "He"  — pure tritium recombination,  J = -Kr·c²
-            "H2"  — H2-assisted recombination,   J = -Kr·c² - Kr·c_H2·c
-        The string is embedded verbatim in the output sub-folder name.
-    results_folder : str
-        Root directory; a sweep-gas-specific sub-folder is created inside it.
+    sweep_gas : "He" or "H2"
     """
 
     model = F.HydrogenTransportProblemDiscontinuous()
@@ -266,7 +267,6 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
     cell_tags = _read.cell_tags
     facet_tags = _read.facet_tags
     model.mesh = F.Mesh(mesh=mesh, coordinate_system="cylindrical")
-
     model.facet_meshtags = facet_tags
     model.volume_meshtags = cell_tags
 
@@ -296,16 +296,13 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
     top_cap = F.SurfaceSubdomain(id=ID_TOP_CAP)
     gap_sidewall = F.SurfaceSubdomain(id=ID_GAP_SIDEWALL)
     liquid_surface = F.SurfaceSubdomain(id=ID_LIQUID_SURFACE)
-    # Heater void boundaries on the CLLiF side: explicitly set to zero flux.
-    # Replace with actual heater BC when the heater is re-enabled.
     heater_cap_bc = F.SurfaceSubdomain(id=ID_HEATER_CAP)
     liquid_heater_interface = F.SurfaceSubdomain(id=ID_LIQUID_HEATER_IFACE)
-    # Inconel outer wall split into three surfaces (matching the 3D model structure)
     inconel_outer_bottom = F.SurfaceSubdomain(id=ID_INCONEL_OUTER_BOTTOM)
     inconel_outer_side = F.SurfaceSubdomain(id=ID_INCONEL_OUTER_SIDE)
     inconel_outer_top = F.SurfaceSubdomain(id=ID_INCONEL_OUTER_TOP)
 
-    # --- Discontinuous interface (CLLiF <-> Inconel) ---
+    # --- Discontinuous interface ---
     iface_liquid_inconel = F.Interface(
         id=ID_LIQUID_INCONEL_IFACE,
         subdomains=[vol_cllif, vol_inconel],
@@ -320,15 +317,14 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
         top_cap,
         gap_sidewall,
         liquid_surface,
-        heater_cap_bc,  # top face of heater void (currently zero flux)
-        liquid_heater_interface,  # side face of heater void (currently zero flux)
+        heater_cap_bc,
+        liquid_heater_interface,
         inconel_outer_bottom,
         inconel_outer_side,
         inconel_outer_top,
     ]
     model.interfaces = [iface_liquid_inconel]
 
-    # Map every outer surface to the volume it belongs to
     model.surface_to_volume = {
         left_sym_liquid: vol_cllif,
         left_sym_inconel: vol_inconel,
@@ -352,43 +348,28 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
     ]
 
     # -----------------------------------------------------------------------
-    # Surface-reaction (recombination) boundary conditions
-    # applied to all Inconel outer surfaces.
+    # Recombination boundary conditions on outer Inconel surfaces
     # -----------------------------------------------------------------------
 
     if sweep_gas == "H2":
-        # H2-assisted recombination
-        h2_P_gauge = 3  # psi (gauge)
-        h2_conc_ppm = 1000  # ppm H2 in sweep gas
-        mole_frac_h2 = h2_conc_ppm / 1e6
-        P_atm = 14.7  # psi
-        P_abs = h2_P_gauge + P_atm
-        P_h2 = mole_frac_h2 * P_abs  # psi
-        P_h2 *= 6894.76  # psi -> Pa
-        gas_constant = 8.314
-        T_room = 298  # K  (room temperature for H2 dissolution)
-        h2_conc_mol = P_h2 / (gas_constant * T_room)  # mol/m³
-        h2_conc = (
-            h2_conc_mol * 6.022e23
-        )  # m⁻³, this is the concentration of H2 molecules available for recombination
-
-        # with H2, the recombination reaction will be H + T -> HT, also T + T -> T2, so the flux is J = -Kr·c² - Kr·c_H2·c_ (assuming same Kr for both reactions)
+        h2_conc = compute_h2_conc()
 
         def recombination_flux(c, T):
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
             return -Kr * c**2 - Kr * h2_conc * c
 
-        subfolder = f"{results_folder}/sweep_{sweep_gas}"
+    elif sweep_gas == "He":
+        h2_conc = 0.0
 
-    else:  # sweep_gas == "He"
-        # Pure tritium recombination
         def recombination_flux(c, T):
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
             return -Kr * c**2
 
-        subfolder = f"{results_folder}/sweep_{sweep_gas}"
+    else:
+        raise ValueError(f"Unknown sweep_gas '{sweep_gas}'. Use 'He' or 'H2'.")
 
-    # Outer Inconel surfaces where recombination BCs are applied
+    subfolder = f"{results_folder}/sweep_{sweep_gas}"
+
     outer_inconel_surfaces = [
         inconel_outer_bottom,
         inconel_outer_side,
@@ -409,55 +390,58 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
     inner_vessel_surfaces = [liquid_surface, gap_sidewall, top_cap]
 
     model.boundary_conditions = [
-        # Fixed zero concentration on all inner vessel surfaces (tritium released to gap)
         *[
-            F.FixedConcentrationBC(
-                subdomain=surf,
-                species=T,
-                value=0.0,
-            )
+            F.FixedConcentrationBC(subdomain=surf, species=T, value=0.0)
             for surf in inner_vessel_surfaces
         ],
-        # Recombination BCs on all Inconel outer surfaces
         *recomb_bcs,
     ]
 
-    # --- Temperature ---
     model.temperature = temperature_K
 
-    # --- Time stepping ---
     dt = F.Stepsize(
-        initial_value=10,  # seconds
+        initial_value=10,
         growth_factor=1.1,
         cutback_factor=0.9,
         target_nb_iterations=4,
         milestones=[irradiation_time],
     )
 
-    # --- Solver settings ---
     model.settings = F.Settings(
         transient=True,
         atol=atol,
         rtol=rtol,
-        final_time=60 * 24 * 3600,  # 60 days in seconds
-        # final_time=12 * 3600,
+        final_time=60 * 24 * 3600,
         stepsize=dt,
     )
 
-    # --- Exports ---
+    # -----------------------------------------------------------------------
+    # Exports
+    # -----------------------------------------------------------------------
+
+    # Helper to build a recomb-eq flux export for a given outer surface
+    def make_recomb_eq_export(surface, name, filename):
+        return CylindricalSurfaceFluxFromEquation(
+            field=T,
+            surface=surface,
+            filename=filename,
+            volume_subdomain=vol_inconel,
+            inconel_Kr_0=inconel_Kr_0,
+            inconel_E_Kr=inconel_E_Kr,
+            temperature=temperature_K,
+            h2_conc=h2_conc,  # 0.0 for He, real value for H2
+            name=name,
+        )
+
     model.exports = [
-        # Concentration fields (VTX format for ParaView)
+        # Concentration fields
         F.VTXSpeciesExport(
-            filename=f"{subfolder}/T_cllif.bp",
-            field=T,
-            subdomain=vol_cllif,
+            filename=f"{subfolder}/T_cllif.bp", field=T, subdomain=vol_cllif
         ),
         F.VTXSpeciesExport(
-            filename=f"{subfolder}/T_inconel.bp",
-            field=T,
-            subdomain=vol_inconel,
+            filename=f"{subfolder}/T_inconel.bp", field=T, subdomain=vol_inconel
         ),
-        # # Surface fluxes computed from -D grad(c) . n * r (cylindrical)
+        # ---- Gradient-based fluxes (-D grad c . n) on every surface ----
         CylindricalSurfaceFlux(
             field=T,
             surface=liquid_surface,
@@ -500,41 +484,31 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
             volume_subdomain=vol_inconel,
             name="Inconel outer top",
         ),
-        # Recombination-equation fluxes computed from -Kr * c^2 * r (cylindrical)
-        CylindricalSurfaceFluxFromEquation(
-            field=T,
-            surface=inconel_outer_bottom,
-            filename=f"{subfolder}/flux_inconel_outer_bottom_recomb_eq.csv",
-            volume_subdomain=vol_inconel,
-            inconel_Kr_0=inconel_Kr_0,
-            inconel_E_Kr=inconel_E_Kr,
-            temperature=temperature_K,
-            name="Inconel outer bottom",
+        # ---- Recomb-eq (physical release) fluxes on all 3 outer surfaces ----
+        make_recomb_eq_export(
+            inconel_outer_bottom,
+            "Inconel outer bottom",
+            f"{subfolder}/flux_inconel_outer_bottom_recomb_eq.csv",
         ),
-        CylindricalSurfaceFluxFromEquation(
-            field=T,
-            surface=inconel_outer_side,
-            filename=f"{subfolder}/flux_inconel_outer_side_recomb_eq.csv",
-            volume_subdomain=vol_inconel,
-            inconel_Kr_0=inconel_Kr_0,
-            inconel_E_Kr=inconel_E_Kr,
-            temperature=temperature_K,
-            name="Inconel outer side",
+        make_recomb_eq_export(
+            inconel_outer_side,
+            "Inconel outer side",
+            f"{subfolder}/flux_inconel_outer_side_recomb_eq.csv",
         ),
-        # Tritium inventory per volume region
+        make_recomb_eq_export(
+            inconel_outer_top,
+            "Inconel outer top",
+            f"{subfolder}/flux_inconel_outer_top_recomb_eq.csv",
+        ),
+        # ---- Tritium inventory per region ----
         F.TotalVolume(
-            field=T,
-            volume=vol_cllif,
-            filename=f"{subfolder}/inventory_cllif.csv",
+            field=T, volume=vol_cllif, filename=f"{subfolder}/inventory_cllif.csv"
         ),
         F.TotalVolume(
-            field=T,
-            volume=vol_inconel,
-            filename=f"{subfolder}/inventory_inconel.csv",
+            field=T, volume=vol_inconel, filename=f"{subfolder}/inventory_inconel.csv"
         ),
     ]
 
-    # return model, T, vol_cllif, vol_inconel
     return model
 
 
@@ -544,57 +518,16 @@ def build_model(sweep_gas: str, results_folder: str = "results/baby_2d"):
 
 
 if __name__ == "__main__":
-    # set_log_level(LogLevel.INFO)
-    # model, T, vol_cllif, vol_inconel = build_model(sweep_gas="He")
+    # ---- He sweep ----
     model = build_model(sweep_gas="He")
     model.initialise()
     model.run()
-
-    # from dolfinx import geometry
-    # import numpy as np
-
-    # u_flibe = T.subdomain_to_post_processing_solution[vol_cllif]
-    # u_inconel = T.subdomain_to_post_processing_solution[vol_inconel]
-
-    # r_iface = 0.07
-    # z_test = 0.0558
-
-    # mesh_flibe = vol_cllif.submesh
-    # mesh_inconel = vol_inconel.submesh
-
-    # bb_tree_flibe = geometry.bb_tree(mesh_flibe, mesh_flibe.topology.dim)
-    # bb_tree_inconel = geometry.bb_tree(mesh_inconel, mesh_inconel.topology.dim)
-
-    # def eval_at(u, bb_tree, mesh, r, z):
-    #     pt = np.array([[r, z, 0.0]])
-    #     candidates = geometry.compute_collisions_points(bb_tree, pt)
-    #     cells = geometry.compute_colliding_cells(mesh, candidates, pt)
-    #     return u.eval(pt, np.array([cells.links(0)[0]]))[0]
-
-    # c_l = eval_at(u_flibe, bb_tree_flibe, mesh_flibe, r_iface, z_test)
-    # c_r = eval_at(u_inconel, bb_tree_inconel, mesh_inconel, r_iface, z_test)
-
-    # print(f"c_flibe          = {c_l}")
-    # print(f"c_inconel        = {c_r}")
-    # print(f"c_henry/K_H      = {c_l / K_flibe}")
-    # print(f"(c_sievert/K_S)^2 = {(c_r / K_inconel) ** 2}")
-    # print(f"henry ratio            = {(c_l / K_flibe) / (c_r / K_inconel) ** 2:.4e}")
-
-    # for export in model.exports:
-    #     if hasattr(export, "data") and len(export.data) > 0:
-    #         print(f"{export.title}: {export.data[-1]:.3e}")
-
     del model
     gc.collect()
 
-    # model, T, vol_cllif, vol_inconel = build_model(sweep_gas="H2")
-    # model = build_model(sweep_gas="H2")
-    # model.initialise()
-    # model.run()
-
-    # # for export in model.exports:
-    # #     if hasattr(export, "data") and len(export.data) > 0:
-    # #         print(f"{export.title}: {export.data[-1]:.3e}")
-
-    # del model
-    # gc.collect()
+    # ---- H2 sweep ----
+    model = build_model(sweep_gas="H2")
+    model.initialise()
+    model.run()
+    del model
+    gc.collect()
