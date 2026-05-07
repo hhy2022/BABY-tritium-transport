@@ -160,6 +160,79 @@ class CylindricalSurfaceFluxFromEquation(F.SurfaceFlux):
         self.data.append(self.value)
 
 
+class CylindricalSurfaceFluxMassTransfer(F.SurfaceFlux):
+    """
+    Cylindrical release flux from a first-order mass-transfer law.
+
+    Boundary law:
+        J_release = k * c
+
+    Integrated release:
+        R = integral(k * c * 2πr dS)
+    """
+
+    azimuth_range: tuple = (0.0, 2 * np.pi)
+
+    def __init__(self, field, surface, filename, k, name=None):
+        super().__init__(field=field, surface=surface, filename=filename)
+        self.k = k
+        self._name = name
+
+    @property
+    def title(self):
+        label = self._name if self._name else f"surface {self.surface.id}"
+        return f"{self.field.name} mass-transfer release {label}"
+
+    def compute(self, u, ds, entity_maps=None):
+        from scifem import assemble_scalar
+
+        if isinstance(u, ufl.indexed.Indexed):
+            mesh = self.field.sub_function_space.mesh
+        else:
+            mesh = u.function_space.mesh
+
+        x = ufl.SpatialCoordinate(mesh)
+        r = x[0]
+
+        flux = assemble_scalar(
+            fem.form(
+                self.k * u * r * ds(self.surface.id),
+                entity_maps=entity_maps,
+            )
+        )
+        flux *= self.azimuth_range[1] - self.azimuth_range[0]
+
+        self.value = flux
+        self.data.append(self.value)
+
+
+class CylindricalTotalVolume(F.TotalVolume):
+    """
+    TotalVolume for 2D axisymmetric (r, z) mesh.
+    Computes: N = integral(u * 2π r dr dz) = real 3D inventory [particles]
+    """
+
+    azimuth_range: tuple = (0.0, 2 * np.pi)
+
+    def compute(self, u, dx, entity_maps=None):
+        from scifem import assemble_scalar
+
+        mesh = u.function_space.mesh
+        x = ufl.SpatialCoordinate(mesh)
+        r = x[0]
+
+        total = assemble_scalar(
+            fem.form(
+                u * r * dx(self.volume.id),
+                entity_maps=entity_maps,
+            )
+        )
+        total *= self.azimuth_range[1] - self.azimuth_range[0]
+
+        self.value = total
+        self.data.append(self.value)
+
+
 # ---------------------------------------------------------------------------
 # Fetch irradiation time
 # ---------------------------------------------------------------------------
@@ -202,7 +275,8 @@ V_CLLIF = 1.0e-3
 htm_D_flibe = htm.diffusivities.filter(material="flibe").filter(author="calderoni")
 htm_S_flibe = htm.solubilities.filter(material="flibe").filter(author="calderoni")
 
-flibe_D_0 = htm_D_flibe[0].pre_exp.magnitude * 0.2
+flibe_D_0 = htm_D_flibe[0].pre_exp.magnitude
+flibe_D_0 *= 0.2  # penalty to slow down diffusion and get more release from the surface
 flibe_E_D = htm_D_flibe[0].act_energy.magnitude
 flibe_S_0 = htm_S_flibe[0].pre_exp.magnitude
 flibe_E_S = htm_S_flibe[0].act_energy.magnitude
@@ -211,7 +285,8 @@ htm_D_inconel = htm.diffusivities.filter(material="inconel_625")
 htm_S_inconel = htm.solubilities.filter(material="inconel_625")
 htm_recomb_inconel = htm.recombination_coeffs.filter(material="inconel_625")
 
-inconel_D_0 = htm_D_inconel[0].pre_exp.magnitude * 10
+inconel_D_0 = htm_D_inconel[0].pre_exp.magnitude
+inconel_D_0 *= 2  # penalty to speed up diffusion and get more release from the surface
 inconel_E_D = htm_D_inconel[0].act_energy.magnitude
 inconel_S_0 = htm_S_inconel[0].pre_exp.magnitude
 inconel_E_S = htm_S_inconel[0].act_energy.magnitude
@@ -231,7 +306,23 @@ temperature_K = 650 + 273.15
 # D_inconel = inconel_D_0 * np.exp(-inconel_E_D / (8.617e-5 * temperature_K))
 # K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
 
-penalty = 1e31
+# print(D_flibe, K_flibe)
+# print(D_inconel, K_inconel)
+# print("+++++++")
+# flibe_D_0 = flibe_D_0 * 0.2
+# inconel_D_0 = inconel_D_0 * 10
+
+# D_flibe = flibe_D_0 * np.exp(-flibe_E_D / (8.617e-5 * temperature_K))
+# K_flibe = flibe_S_0 * np.exp(-flibe_E_S / (8.617e-5 * temperature_K))
+# D_inconel = inconel_D_0 * np.exp(-inconel_E_D / (8.617e-5 * temperature_K))
+# K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
+# print(D_flibe, K_flibe)
+# print(D_inconel, K_inconel)
+# exit()
+
+
+penalty = 1e30
+# penalty = 1e10
 atol = 1e-6
 rtol = 1e-6
 
@@ -277,7 +368,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     # exit(0)
 
     def tritium_source(t):
-        return source_strength if t < irradiation_time else 0.0
+        return source_strength if t <= irradiation_time else 0.0
 
     model = F.HydrogenTransportProblemDiscontinuous()
 
@@ -323,6 +414,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     inconel_outer_top = F.SurfaceSubdomain(id=ID_INCONEL_OUTER_TOP)
 
     # --- Discontinuous interface ---
+    # model.method_interface = "nitsche"
     iface_liquid_inconel = F.Interface(
         id=ID_LIQUID_INCONEL_IFACE,
         subdomains=[vol_cllif, vol_inconel],
@@ -390,6 +482,17 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
     subfolder = f"{results_folder}/run_{run_id}/sweep_{sweep_gas}"
 
+    # -----------------------------------------------------------------------
+    # First-order release coefficients [m/s]
+    # J_release = k * c
+    # -----------------------------------------------------------------------
+
+    k_release = {
+        "liquid_surface": 1e-3,
+        "gap_sidewall": 1e-3,
+        "top_cap": 1e-3,
+    }
+
     # outer_inconel_surfaces = [
     #     inconel_outer_bottom,
     #     inconel_outer_side,
@@ -407,13 +510,38 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     #     bc._volume_subdomain = vol_inconel
     #     recomb_bcs.append(bc)
 
-    inner_vessel_surfaces = [liquid_surface, gap_sidewall, top_cap]
+    # inner_vessel_surfaces = [liquid_surface, gap_sidewall, top_cap]
+
+    # model.boundary_conditions = [
+    #     *[
+    #         F.FixedConcentrationBC(subdomain=surf, species=T, value=0.0)
+    #         for surf in inner_vessel_surfaces
+    #     ],
+    #     *recomb_bcs,
+    # ]
+    def mass_transfer_flux(k):
+        def flux(c, T):
+            return -k * c
+
+        return flux
+
+    mass_transfer_bcs = []
+
+    for surf, k_val in [
+        (liquid_surface, k_release["liquid_surface"]),
+        (gap_sidewall, k_release["gap_sidewall"]),
+        (top_cap, k_release["top_cap"]),
+    ]:
+        bc = F.ParticleFluxBC(
+            value=mass_transfer_flux(k_val),
+            subdomain=surf,
+            species_dependent_value={"c": T},
+            species=T,
+        )
+        mass_transfer_bcs.append(bc)
 
     model.boundary_conditions = [
-        *[
-            F.FixedConcentrationBC(subdomain=surf, species=T, value=0.0)
-            for surf in inner_vessel_surfaces
-        ],
+        *mass_transfer_bcs,
         *recomb_bcs,
     ]
 
@@ -421,7 +549,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
     dt = F.Stepsize(
         initial_value=10,
-        growth_factor=1.1,
+        growth_factor=1.05,
         cutback_factor=0.9,
         target_nb_iterations=4,
         milestones=[irradiation_time],
@@ -431,7 +559,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         transient=True,
         atol=atol,
         rtol=rtol,
-        final_time=60 * 24 * 3600,
+        final_time=80 * 24 * 3600,
         stepsize=dt,
     )
 
@@ -462,23 +590,44 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             filename=f"{subfolder}/T_inconel.bp", field=T, subdomain=vol_inconel
         ),
         # ---- Gradient-based fluxes (-D grad c . n) on every surface ----
-        CylindricalSurfaceFlux(
+        # CylindricalSurfaceFlux(
+        #     field=T,
+        #     surface=liquid_surface,
+        #     filename=f"{subfolder}/flux_liquid_surface.csv",
+        #     name="liquid surface",
+        # ),
+        # CylindricalSurfaceFlux(
+        #     field=T,
+        #     surface=top_cap,
+        #     filename=f"{subfolder}/flux_inconel_top_cap.csv",
+        #     name="Inconel top cap",
+        # ),
+        # CylindricalSurfaceFlux(
+        #     field=T,
+        #     surface=gap_sidewall,
+        #     filename=f"{subfolder}/flux_gap_sidewall.csv",
+        #     name="Inconel gap sidewall",
+        # ),
+        CylindricalSurfaceFluxMassTransfer(
             field=T,
             surface=liquid_surface,
             filename=f"{subfolder}/flux_liquid_surface.csv",
+            k=k_release["liquid_surface"],
             name="liquid surface",
         ),
-        CylindricalSurfaceFlux(
-            field=T,
-            surface=top_cap,
-            filename=f"{subfolder}/flux_inconel_top_cap.csv",
-            name="Inconel top cap",
-        ),
-        CylindricalSurfaceFlux(
+        CylindricalSurfaceFluxMassTransfer(
             field=T,
             surface=gap_sidewall,
+            filename=f"{subfolder}/flux_inconel_top_cap.csv",
+            k=k_release["gap_sidewall"],
+            name="gap sidewall",
+        ),
+        CylindricalSurfaceFluxMassTransfer(
+            field=T,
+            surface=top_cap,
             filename=f"{subfolder}/flux_gap_sidewall.csv",
-            name="Inconel gap sidewall",
+            k=k_release["top_cap"],
+            name="top cap",
         ),
         # CylindricalSurfaceFlux(
         #     field=T,
@@ -515,16 +664,16 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         #     f"{subfolder}/flux_inconel_outer_top_recomb_eq.csv",
         # ),
         # ---- Tritium inventory per region ----
-        F.TotalVolume(
+        CylindricalTotalVolume(
             field=T, volume=vol_cllif, filename=f"{subfolder}/inventory_cllif.csv"
         ),
-        F.TotalVolume(
+        CylindricalTotalVolume(
             field=T, volume=vol_inconel, filename=f"{subfolder}/inventory_inconel.csv"
         ),
     ]
 
-    return model
-    # return model, T, vol_cllif, vol_inconel
+    # return model
+    return model, T, vol_cllif, vol_inconel
 
 
 # ---------------------------------------------------------------------------
@@ -533,13 +682,163 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
 
 if __name__ == "__main__":
-    for run_id in [1, 2]:
+    for run_id in [2]:
         # for run_id in [1, 2, 4]:
         print(f"\n=== Run {run_id} / He sweep ===")
-        model = build_model(sweep_gas="He", run_id=run_id)
-        # model, T, vol_cllif, vol_inconel = build_model(sweep_gas="He", run_id=run_id)
+        # set_log_level(LogLevel.INFO)
+        # model = build_model(sweep_gas="He", run_id=run_id)
+        model, T, vol_cllif, vol_inconel = build_model(sweep_gas="He", run_id=run_id)
         model.initialise()
         model.run()
+
+        # ---------------------------------------------------------------------------
+        # Mass balance diagnostic
+        # Put this immediately after model.run()
+        # ---------------------------------------------------------------------------
+
+        import pandas as pd
+        import numpy as np
+        import ufl
+        from dolfinx import fem
+        from scifem import assemble_scalar
+        from scipy.integrate import cumulative_trapezoid
+        from libra_toolbox.tritium.model import quantity_to_activity, ureg
+
+        def particles_to_bq(n_particles):
+            return (
+                quantity_to_activity(ureg.Quantity(n_particles, "particle"))
+                .to(ureg.Bq)
+                .magnitude
+            )
+
+        def integrate_inventory_submesh(vol_obj):
+            """Direct inventory integral on submesh: ∫ c 2πr dΩ."""
+            u_sub = T.subdomain_to_post_processing_solution[vol_obj]
+            submesh = vol_obj.submesh
+
+            x = ufl.SpatialCoordinate(submesh)
+            r = x[0]
+            dx = ufl.Measure("dx", domain=submesh)
+
+            inv = assemble_scalar(fem.form(2 * np.pi * r * u_sub * dx))
+            vol_3d = assemble_scalar(fem.form(2 * np.pi * r * dx))
+
+            return inv, vol_3d
+
+        def integrate_flux_csv(path, method="backward"):
+            """
+            Integrate surface flux CSV [particles/s] over time [s].
+            method:
+                backward  : sum j[n+1] * dt, closer to implicit transient output
+                trapezoid : scipy cumulative_trapezoid
+                forward   : sum j[n] * dt
+            """
+            df = pd.read_csv(path)
+            t = df.iloc[:, 0].to_numpy()
+            j = df.iloc[:, 1].to_numpy()
+
+            if method == "backward":
+                total = np.sum(j[1:] * np.diff(t))
+            elif method == "forward":
+                total = np.sum(j[:-1] * np.diff(t))
+            elif method == "trapezoid":
+                total = cumulative_trapezoid(j, x=t, initial=0)[-1]
+            else:
+                raise ValueError(method)
+
+            return total, t, j
+
+        base = f"results/baby_2d/run_{run_id}/sweep_He"
+
+        # ---- 1. Inventory from direct submesh integration ----
+        inv_cllif, vol_cllif_3d = integrate_inventory_submesh(vol_cllif)
+        inv_inconel, vol_inconel_3d = integrate_inventory_submesh(vol_inconel)
+        stored = inv_cllif + inv_inconel
+
+        # ---- 2. Expected total production ----
+        produced = TRITIUM_PRODUCTION[run_id]
+
+        # ---- 3. Release inferred from mass balance ----
+        release_by_balance = produced - stored
+
+        # ---- 4. Release from exported surface fluxes ----
+        flux_paths = {
+            "liquid_surface": f"{base}/flux_liquid_surface.csv",
+            "gap_sidewall": f"{base}/flux_gap_sidewall.csv",
+            "top_cap": f"{base}/flux_inconel_top_cap.csv",
+        }
+
+        release_flux = {}
+        for method in ["backward", "trapezoid", "forward"]:
+            release_flux[method] = {}
+            for name, path in flux_paths.items():
+                val, t, j = integrate_flux_csv(path, method=method)
+                release_flux[method][name] = val
+
+        # ---- 5. Print report ----
+        print("\n" + "=" * 80)
+        print("MASS BALANCE DIAGNOSTIC")
+        print("=" * 80)
+
+        print("\n--- Mesh volume check ---")
+        print(f"CLLiF volume       = {vol_cllif_3d:.6e} m^3")
+        print(f"Inconel volume     = {vol_inconel_3d:.6e} m^3")
+
+        print("\n--- Inventory ---")
+        print(
+            f"CLLiF inventory    = {inv_cllif:.6e} particles = {particles_to_bq(inv_cllif):.6f} Bq"
+        )
+        print(
+            f"Inconel inventory  = {inv_inconel:.6e} particles = {particles_to_bq(inv_inconel):.6f} Bq"
+        )
+        print(
+            f"Stored total       = {stored:.6e} particles = {particles_to_bq(stored):.6f} Bq"
+        )
+
+        print("\n--- Production and balance-inferred release ---")
+        print(
+            f"Produced total     = {produced:.6e} particles = {particles_to_bq(produced):.6f} Bq"
+        )
+        print(
+            f"Release by balance = {release_by_balance:.6e} particles = {particles_to_bq(release_by_balance):.6f} Bq"
+        )
+
+        print("\n--- Surface-flux-integrated release ---")
+        for method in ["backward", "trapezoid", "forward"]:
+            total_method = sum(release_flux[method].values())
+            print(f"\nMethod: {method}")
+            for name, val in release_flux[method].items():
+                print(
+                    f"  {name:16s} = {val:.6e} particles = {particles_to_bq(val):.6f} Bq"
+                )
+            print(
+                f"  {'TOTAL':16s} = {total_method:.6e} particles = {particles_to_bq(total_method):.6f} Bq"
+            )
+
+        print("\n--- Difference: balance release minus flux-integrated release ---")
+        for method in ["backward", "trapezoid", "forward"]:
+            total_method = sum(release_flux[method].values())
+            diff = release_by_balance - total_method
+            rel = diff / produced * 100
+            print(
+                f"{method:10s}: diff = {diff:.6e} particles "
+                f"= {particles_to_bq(diff):.6f} Bq "
+                f"= {rel:.3f}% of produced"
+            )
+
+        print("\n--- CSV time coverage check ---")
+        for name, path in flux_paths.items():
+            df = pd.read_csv(path)
+            t = df.iloc[:, 0].to_numpy()
+            j = df.iloc[:, 1].to_numpy()
+            print(
+                f"{name:16s}: t_start = {t[0]:.6e} s, t_end = {t[-1]:.6e} s, n = {len(t)}"
+            )
+            print(
+                f"  j_min = {j.min():.6e}, j_max = {j.max():.6e}, j_final = {j[-1]:.6e}"
+            )
+
+        print("=" * 80 + "\n")
 
         # from dolfinx import geometry
         # import numpy as np
