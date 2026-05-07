@@ -276,20 +276,36 @@ def generate_baby_upper_2d_mesh(
     gmsh.model.mesh.setSize(gmsh.model.getEntities(0), mesh_size)
 
     # Refine mesh near the CLLiF/Inconel interface
-    f_dist = gmsh.model.mesh.field.add("Distance")
-    gmsh.model.mesh.field.setNumbers(f_dist, "CurvesList", curve_tags_1)
+    f_dist_iface = gmsh.model.mesh.field.add("Distance")
+    gmsh.model.mesh.field.setNumbers(f_dist_iface, "CurvesList", curve_tags_1)
 
-    f_thresh = gmsh.model.mesh.field.add("Threshold")
-    gmsh.model.mesh.field.setNumber(f_thresh, "InField", f_dist)
-    gmsh.model.mesh.field.setNumber(
-        f_thresh, "SizeMin", mesh_size / 5
-    )  # 0.0002 m near interface
-    gmsh.model.mesh.field.setNumber(f_thresh, "SizeMax", mesh_size)  # 0.001 m far away
-    gmsh.model.mesh.field.setNumber(f_thresh, "DistMin", 0.002)  # refine within 2mm
-    gmsh.model.mesh.field.setNumber(f_thresh, "DistMax", 0.010)  # transition over 10mm
+    f_thresh_iface = gmsh.model.mesh.field.add("Threshold")
+    gmsh.model.mesh.field.setNumber(f_thresh_iface, "InField", f_dist_iface)
+    gmsh.model.mesh.field.setNumber(f_thresh_iface, "SizeMin", mesh_size / 5)
+    gmsh.model.mesh.field.setNumber(f_thresh_iface, "SizeMax", mesh_size)
+    gmsh.model.mesh.field.setNumber(f_thresh_iface, "DistMin", 0.002)
+    gmsh.model.mesh.field.setNumber(f_thresh_iface, "DistMax", 0.006)
 
-    gmsh.model.mesh.field.setAsBackgroundMesh(f_thresh)
+    # Refine mesh near the liquid surface
+    f_dist_liquid = gmsh.model.mesh.field.add("Distance")
+    gmsh.model.mesh.field.setNumbers(f_dist_liquid, "CurvesList", [18])
 
+    f_thresh_liquid = gmsh.model.mesh.field.add("Threshold")
+    gmsh.model.mesh.field.setNumber(f_thresh_liquid, "InField", f_dist_liquid)
+    gmsh.model.mesh.field.setNumber(f_thresh_liquid, "SizeMin", mesh_size / 5)
+    gmsh.model.mesh.field.setNumber(f_thresh_liquid, "SizeMax", mesh_size)
+    gmsh.model.mesh.field.setNumber(f_thresh_liquid, "DistMin", 0.002)
+    gmsh.model.mesh.field.setNumber(f_thresh_liquid, "DistMax", 0.006)
+
+    # Use the finest size requested by either refinement field
+    f_min = gmsh.model.mesh.field.add("Min")
+    gmsh.model.mesh.field.setNumbers(
+        f_min,
+        "FieldsList",
+        [f_thresh_iface, f_thresh_liquid],
+    )
+
+    gmsh.model.mesh.field.setAsBackgroundMesh(f_min)
     gmsh.model.mesh.generate(2)
     gmsh.write(fname)
 
