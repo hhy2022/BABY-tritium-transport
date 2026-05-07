@@ -559,7 +559,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         transient=True,
         atol=atol,
         rtol=rtol,
-        final_time=80 * 24 * 3600,
+        final_time=60 * 24 * 3600,
         stepsize=dt,
     )
 
@@ -682,7 +682,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
 
 if __name__ == "__main__":
-    for run_id in [2]:
+    for run_id in [1, 2]:
         # for run_id in [1, 2, 4]:
         print(f"\n=== Run {run_id} / He sweep ===")
         # set_log_level(LogLevel.INFO)
@@ -776,9 +776,9 @@ if __name__ == "__main__":
                 release_flux[method][name] = val
 
         # ---- 5. Print report ----
-        print("\n" + "=" * 80)
+        print("\n" + "=" * 60)
         print("MASS BALANCE DIAGNOSTIC")
-        print("=" * 80)
+        print("=" * 60)
 
         print("\n--- Mesh volume check ---")
         print(f"CLLiF volume       = {vol_cllif_3d:.6e} m^3")
@@ -838,7 +838,7 @@ if __name__ == "__main__":
                 f"  j_min = {j.min():.6e}, j_max = {j.max():.6e}, j_final = {j[-1]:.6e}"
             )
 
-        print("=" * 80 + "\n")
+        print("=" * 60 + "\n")
 
         # from dolfinx import geometry
         # import numpy as np
