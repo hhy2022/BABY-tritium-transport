@@ -257,6 +257,31 @@ def get_total_irradiation_time(run_id: int) -> float:
     return duration
 
 
+def get_total_measurement_time(run_id: int) -> float:
+    """
+    Return the time of the last tritium release measurement for this run [seconds].
+    This is typically much longer than the irradiation time (post-irradiation
+    sampling continues for days/weeks).
+    """
+    from libra_toolbox.tritium.model import ureg
+
+    url = RUN_URLS[run_id]
+    data = requests.get(url).json()
+    cr = data["cumulative_tritium_release"]
+
+    # Sampling times from both IV and OV; take the maximum to cover full measurement window
+    iv_times = cr["IV"]["sampling_times"]
+    ov_times = cr["OV"]["sampling_times"]
+
+    # Get unit (typically "day")
+    unit = iv_times.get("unit", "day")
+    iv_max = max(iv_times["value"]) * ureg(unit)
+    ov_max = max(ov_times["value"]) * ureg(unit)
+
+    t_max = max(iv_max, ov_max).to(ureg("s")).magnitude
+    return t_max
+
+
 # Total tritium production per run [particles] — Table 2 from BABY-1L paper, last column
 TRITIUM_PRODUCTION = {
     1: 9.45e9,
@@ -286,7 +311,7 @@ htm_S_inconel = htm.solubilities.filter(material="inconel_625")
 htm_recomb_inconel = htm.recombination_coeffs.filter(material="inconel_625")
 
 inconel_D_0 = htm_D_inconel[0].pre_exp.magnitude
-inconel_D_0 *= 5  # penalty to speed up diffusion and get more release from the surface
+inconel_D_0 *= 2  # penalty to speed up diffusion and get more release from the surface
 inconel_E_D = htm_D_inconel[0].act_energy.magnitude
 inconel_S_0 = htm_S_inconel[0].pre_exp.magnitude
 inconel_E_S = htm_S_inconel[0].act_energy.magnitude
@@ -361,6 +386,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     """
 
     irradiation_time = get_total_irradiation_time(run_id)
+    measurement_time = get_total_measurement_time(run_id)
 
     # Average volumetric production rate during irradiation [T / m^3 / s]
     source_strength = TRITIUM_PRODUCTION[run_id] / (irradiation_time * V_CLLIF)
@@ -466,9 +492,14 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     if sweep_gas == "H2":
         h2_conc = compute_h2_conc()
 
-        def recombination_flux(c, T):
-            Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
-            return -Kr * c**2 - Kr * h2_conc * c
+        def make_recomb_flux(h2_conc):
+            def flux(c, T):
+                Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
+                return -Kr * c**2 - Kr * h2_conc * c
+
+            return flux
+
+        recombination_flux = make_recomb_flux(h2_conc)
 
     elif sweep_gas == "He":
         h2_conc = 0.0
@@ -488,27 +519,33 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     # -----------------------------------------------------------------------
 
     k_release = {
-        "liquid_surface": 1e-3,
-        "gap_sidewall": 1e-3,
-        "top_cap": 1e-3,
+        "liquid_surface": 1e15,
+        "gap_sidewall": 1e15,
+        "top_cap": 1e15,
     }
 
-    # outer_inconel_surfaces = [
-    #     inconel_outer_bottom,
-    #     inconel_outer_side,
-    #     inconel_outer_top,
-    # ]
+    outer_inconel_surfaces = [
+        inconel_outer_bottom,
+        inconel_outer_side,
+        inconel_outer_top,
+    ]
+
+    solid_recombination_surface = [
+        # gap_sidewall,
+        # top_cap,
+        *outer_inconel_surfaces,
+    ]
 
     recomb_bcs = []
-    # for surf in outer_inconel_surfaces:
-    #     bc = F.ParticleFluxBC(
-    #         value=recombination_flux,
-    #         subdomain=surf,
-    #         species_dependent_value={"c": T},
-    #         species=T,
-    #     )
-    #     bc._volume_subdomain = vol_inconel
-    #     recomb_bcs.append(bc)
+    for surf in solid_recombination_surface:
+        bc = F.ParticleFluxBC(
+            value=recombination_flux,
+            subdomain=surf,
+            species_dependent_value={"c": T},
+            species=T,
+        )
+        bc._volume_subdomain = vol_inconel
+        recomb_bcs.append(bc)
 
     # inner_vessel_surfaces = [liquid_surface, gap_sidewall, top_cap]
 
@@ -559,7 +596,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         transient=True,
         atol=atol,
         rtol=rtol,
-        final_time=60 * 24 * 3600,
+        final_time=measurement_time,
         stepsize=dt,
     )
 
@@ -648,20 +685,30 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         #     name="Inconel outer top",
         # ),
         # # ---- Recomb-eq (physical release) fluxes on all 3 outer surfaces ----
+        make_recomb_eq_export(
+            inconel_outer_bottom,
+            "Inconel outer bottom",
+            f"{subfolder}/flux_inconel_outer_bottom_recomb_eq.csv",
+        ),
+        make_recomb_eq_export(
+            inconel_outer_side,
+            "Inconel outer side",
+            f"{subfolder}/flux_inconel_outer_side_recomb_eq.csv",
+        ),
+        make_recomb_eq_export(
+            inconel_outer_top,
+            "Inconel outer top",
+            f"{subfolder}/flux_inconel_outer_top_recomb_eq.csv",
+        ),
         # make_recomb_eq_export(
-        #     inconel_outer_bottom,
-        #     "Inconel outer bottom",
-        #     f"{subfolder}/flux_inconel_outer_bottom_recomb_eq.csv",
+        #     gap_sidewall,
+        #     "gap sidewall",
+        #     f"{subfolder}/flux_gap_sidewall.csv",
         # ),
         # make_recomb_eq_export(
-        #     inconel_outer_side,
-        #     "Inconel outer side",
-        #     f"{subfolder}/flux_inconel_outer_side_recomb_eq.csv",
-        # ),
-        # make_recomb_eq_export(
-        #     inconel_outer_top,
-        #     "Inconel outer top",
-        #     f"{subfolder}/flux_inconel_outer_top_recomb_eq.csv",
+        #     top_cap,
+        #     "top cap",
+        #     f"{subfolder}/flux_inconel_top_cap.csv",
         # ),
         # ---- Tritium inventory per region ----
         CylindricalTotalVolume(
@@ -682,7 +729,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
 
 if __name__ == "__main__":
-    for run_id in [1, 2]:
+    for run_id in [1]:
         # for run_id in [1, 2, 4]:
         print(f"\n=== Run {run_id} / He sweep ===")
         # set_log_level(LogLevel.INFO)
