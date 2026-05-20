@@ -303,7 +303,7 @@ htm_S_flibe = htm.solubilities.filter(material="flibe").filter(author="calderoni
 flibe_D_0 = htm_D_flibe[0].pre_exp.magnitude
 flibe_D_0 *= 0.4  # penalty to slow down diffusion and get more release from the surface
 flibe_E_D = htm_D_flibe[0].act_energy.magnitude
-flibe_S_0 = htm_S_flibe[0].pre_exp.magnitude
+flibe_S_0 = htm_S_flibe[0].pre_exp.magnitude * 1e12
 flibe_E_S = htm_S_flibe[0].act_energy.magnitude
 
 htm_D_inconel = htm.diffusivities.filter(material="inconel_625")
@@ -312,7 +312,7 @@ htm_recomb_inconel = htm.recombination_coeffs.filter(material="inconel_625")
 
 inconel_D_0 = htm_D_inconel[0].pre_exp.magnitude
 inconel_E_D = htm_D_inconel[0].act_energy.magnitude
-inconel_S_0 = htm_S_inconel[0].pre_exp.magnitude * 1e-6
+inconel_S_0 = htm_S_inconel[0].pre_exp.magnitude
 inconel_E_S = htm_S_inconel[0].act_energy.magnitude
 
 inconel_Kr_0 = htm_recomb_inconel[1].pre_exp.magnitude
@@ -348,8 +348,8 @@ K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
 # print(f"Kr        = {Kr:.3e}  m^4/s/atom")
 # exit(0)
 
-# penalty = 1e22  # this is used for the run 1 with the factor of 1e-5
-penalty = 1e21
+# penalty = 1e32  # this is used for the run 1 & 2 with the factor of 1e12 in the salt solubility.
+penalty = 1e32
 # penalty = 1e10
 atol = 1e-6
 rtol = 1e-6
@@ -510,6 +510,18 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         def recombination_flux(c, T):
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
             return -Kr * c**2
+
+    elif sweep_gas == "He_then_H2":
+        h2_steady = compute_h2_conc()
+        t_switch = 19 * 86400
+
+        def recombination_flux(c, T, t):
+            Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
+            # UFL symbolic conditional instead of Python if
+            h2 = ufl.conditional(ufl.ge(t, t_switch), h2_steady, 0.0)
+            return -Kr * c**2 - Kr * h2 * c
+
+        h2_conc = 0.0
 
     else:
         raise ValueError(f"Unknown sweep_gas '{sweep_gas}'. Use 'He' or 'H2'.")
@@ -732,12 +744,15 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
 
 if __name__ == "__main__":
-    for run_id in [1]:
+    for run_id in [2]:
         # for run_id in [1, 2, 4]:
         print(f"\n=== Run {run_id} / He sweep ===")
         # set_log_level(LogLevel.INFO)
         # model = build_model(sweep_gas="He", run_id=run_id)
         model, T, vol_cllif, vol_inconel = build_model(sweep_gas="He", run_id=run_id)
+        # model, T, vol_cllif, vol_inconel = build_model(
+        #     sweep_gas="He_then_H2", run_id=run_id
+        # )
         model.initialise()
         model.run()
 
