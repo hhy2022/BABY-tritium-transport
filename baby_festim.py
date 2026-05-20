@@ -301,7 +301,7 @@ htm_D_flibe = htm.diffusivities.filter(material="flibe").filter(author="calderon
 htm_S_flibe = htm.solubilities.filter(material="flibe").filter(author="calderoni")
 
 flibe_D_0 = htm_D_flibe[0].pre_exp.magnitude
-flibe_D_0 *= 0.2  # penalty to slow down diffusion and get more release from the surface
+flibe_D_0 *= 0.4  # penalty to slow down diffusion and get more release from the surface
 flibe_E_D = htm_D_flibe[0].act_energy.magnitude
 flibe_S_0 = htm_S_flibe[0].pre_exp.magnitude
 flibe_E_S = htm_S_flibe[0].act_energy.magnitude
@@ -311,9 +311,8 @@ htm_S_inconel = htm.solubilities.filter(material="inconel_625")
 htm_recomb_inconel = htm.recombination_coeffs.filter(material="inconel_625")
 
 inconel_D_0 = htm_D_inconel[0].pre_exp.magnitude
-inconel_D_0 *= 2  # penalty to speed up diffusion and get more release from the surface
 inconel_E_D = htm_D_inconel[0].act_energy.magnitude
-inconel_S_0 = htm_S_inconel[0].pre_exp.magnitude
+inconel_S_0 = htm_S_inconel[0].pre_exp.magnitude * 1e-6
 inconel_E_S = htm_S_inconel[0].act_energy.magnitude
 
 inconel_Kr_0 = htm_recomb_inconel[1].pre_exp.magnitude
@@ -326,27 +325,31 @@ inconel_E_Kr = htm_recomb_inconel[1].act_energy.magnitude
 temperature_K = 650 + 273.15
 # h = 0.001
 
-# D_flibe = flibe_D_0 * np.exp(-flibe_E_D / (8.617e-5 * temperature_K))
-# K_flibe = flibe_S_0 * np.exp(-flibe_E_S / (8.617e-5 * temperature_K))
-# D_inconel = inconel_D_0 * np.exp(-inconel_E_D / (8.617e-5 * temperature_K))
-# K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
+D_flibe = flibe_D_0 * np.exp(-flibe_E_D / (8.617e-5 * temperature_K))
+K_flibe = flibe_S_0 * np.exp(-flibe_E_S / (8.617e-5 * temperature_K))
+D_inconel = inconel_D_0 * np.exp(-inconel_E_D / (8.617e-5 * temperature_K))
+K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
 
 # print(D_flibe, K_flibe)
 # print(D_inconel, K_inconel)
 # print("+++++++")
 # flibe_D_0 = flibe_D_0 * 0.2
-# inconel_D_0 = inconel_D_0 * 10
+# inconel_D_0 = inconel_D_0 * 2
 
 # D_flibe = flibe_D_0 * np.exp(-flibe_E_D / (8.617e-5 * temperature_K))
 # K_flibe = flibe_S_0 * np.exp(-flibe_E_S / (8.617e-5 * temperature_K))
 # D_inconel = inconel_D_0 * np.exp(-inconel_E_D / (8.617e-5 * temperature_K))
 # K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
-# print(D_flibe, K_flibe)
-# print(D_inconel, K_inconel)
-# exit()
+# Kr = inconel_Kr_0 * np.exp(-inconel_E_Kr / (8.617e-5 * temperature_K))
+# print(f"D_flibe   = {D_flibe:.3e}  m^2/s")
+# print(f"K_flibe   = {K_flibe:.3e}  (Henry units)")
+# print(f"D_inconel = {D_inconel:.3e}  m^2/s")
+# print(f"K_inconel = {K_inconel:.3e}  (Sievert units)")
+# print(f"Kr        = {Kr:.3e}  m^4/s/atom")
+# exit(0)
 
-
-penalty = 1e30
+# penalty = 1e22  # this is used for the run 1 with the factor of 1e-5
+penalty = 1e21
 # penalty = 1e10
 atol = 1e-6
 rtol = 1e-6
@@ -519,9 +522,9 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     # -----------------------------------------------------------------------
 
     k_release = {
-        "liquid_surface": 1e15,
-        "gap_sidewall": 1e15,
-        "top_cap": 1e15,
+        "liquid_surface": 1e5,
+        # "gap_sidewall": 1e15,
+        # "top_cap": 1e15,
     }
 
     outer_inconel_surfaces = [
@@ -531,8 +534,8 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     ]
 
     solid_recombination_surface = [
-        # gap_sidewall,
-        # top_cap,
+        gap_sidewall,
+        top_cap,
         *outer_inconel_surfaces,
     ]
 
@@ -566,8 +569,8 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
     for surf, k_val in [
         (liquid_surface, k_release["liquid_surface"]),
-        (gap_sidewall, k_release["gap_sidewall"]),
-        (top_cap, k_release["top_cap"]),
+        # (gap_sidewall, k_release["gap_sidewall"]),
+        # (top_cap, k_release["top_cap"]),
     ]:
         bc = F.ParticleFluxBC(
             value=mass_transfer_flux(k_val),
@@ -586,7 +589,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
     dt = F.Stepsize(
         initial_value=10,
-        growth_factor=1.05,
+        growth_factor=1.1,
         cutback_factor=0.9,
         target_nb_iterations=4,
         milestones=[irradiation_time],
@@ -652,20 +655,20 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             k=k_release["liquid_surface"],
             name="liquid surface",
         ),
-        CylindricalSurfaceFluxMassTransfer(
-            field=T,
-            surface=gap_sidewall,
-            filename=f"{subfolder}/flux_inconel_top_cap.csv",
-            k=k_release["gap_sidewall"],
-            name="gap sidewall",
-        ),
-        CylindricalSurfaceFluxMassTransfer(
-            field=T,
-            surface=top_cap,
-            filename=f"{subfolder}/flux_gap_sidewall.csv",
-            k=k_release["top_cap"],
-            name="top cap",
-        ),
+        # CylindricalSurfaceFluxMassTransfer(
+        #     field=T,
+        #     surface=gap_sidewall,
+        #     filename=f"{subfolder}/flux_gap_sidewall.csv",
+        #     k=k_release["gap_sidewall"],
+        #     name="gap sidewall",
+        # ),
+        # CylindricalSurfaceFluxMassTransfer(
+        #     field=T,
+        #     surface=top_cap,
+        #     filename=f"{subfolder}/flux_inconel_top_cap.csv",
+        #     k=k_release["top_cap"],
+        #     name="top cap",
+        # ),
         # CylindricalSurfaceFlux(
         #     field=T,
         #     surface=inconel_outer_bottom,
@@ -700,16 +703,16 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             "Inconel outer top",
             f"{subfolder}/flux_inconel_outer_top_recomb_eq.csv",
         ),
-        # make_recomb_eq_export(
-        #     gap_sidewall,
-        #     "gap sidewall",
-        #     f"{subfolder}/flux_gap_sidewall.csv",
-        # ),
-        # make_recomb_eq_export(
-        #     top_cap,
-        #     "top cap",
-        #     f"{subfolder}/flux_inconel_top_cap.csv",
-        # ),
+        make_recomb_eq_export(
+            gap_sidewall,
+            "gap sidewall",
+            f"{subfolder}/flux_gap_sidewall.csv",
+        ),
+        make_recomb_eq_export(
+            top_cap,
+            "top cap",
+            f"{subfolder}/flux_inconel_top_cap.csv",
+        ),
         # ---- Tritium inventory per region ----
         CylindricalTotalVolume(
             field=T, volume=vol_cllif, filename=f"{subfolder}/inventory_cllif.csv"
@@ -738,40 +741,40 @@ if __name__ == "__main__":
         model.initialise()
         model.run()
 
-        # from dolfinx import geometry
-        # import numpy as np
+        from dolfinx import geometry
+        import numpy as np
 
-        # u_flibe = T.subdomain_to_post_processing_solution[vol_cllif]
-        # u_inconel = T.subdomain_to_post_processing_solution[vol_inconel]
-        # r_iface = 0.07
-        # z_test = 0.0558
+        u_flibe = T.subdomain_to_post_processing_solution[vol_cllif]
+        u_inconel = T.subdomain_to_post_processing_solution[vol_inconel]
+        r_iface = 0.07
+        z_test = 0.0558
 
-        # mesh_flibe = vol_cllif.submesh
-        # mesh_inconel = vol_inconel.submesh
+        mesh_flibe = vol_cllif.submesh
+        mesh_inconel = vol_inconel.submesh
 
-        # bb_tree_flibe = geometry.bb_tree(mesh_flibe, mesh_flibe.topology.dim)
-        # bb_tree_inconel = geometry.bb_tree(mesh_inconel, mesh_inconel.topology.dim)
+        bb_tree_flibe = geometry.bb_tree(mesh_flibe, mesh_flibe.topology.dim)
+        bb_tree_inconel = geometry.bb_tree(mesh_inconel, mesh_inconel.topology.dim)
 
-        # for export in model.exports:
-        #     if hasattr(export, "data") and len(export.data) > 0:
-        #         print(f"{export.title}: {export.data[-1]:.3e}")
+        for export in model.exports:
+            if hasattr(export, "data") and len(export.data) > 0:
+                print(f"{export.title}: {export.data[-1]:.3e}")
 
-        # def eval_at(u, bb_tree, mesh, r, z):
-        #     pt = np.array([[r, z, 0.0]])
-        #     candidates = geometry.compute_collisions_points(bb_tree, pt)
-        #     cells = geometry.compute_colliding_cells(mesh, candidates, pt)
-        #     return u.eval(pt, np.array([cells.links(0)[0]]))[0]
+        def eval_at(u, bb_tree, mesh, r, z):
+            pt = np.array([[r, z, 0.0]])
+            candidates = geometry.compute_collisions_points(bb_tree, pt)
+            cells = geometry.compute_colliding_cells(mesh, candidates, pt)
+            return u.eval(pt, np.array([cells.links(0)[0]]))[0]
 
-        # c_l = eval_at(u_flibe, bb_tree_flibe, mesh_flibe, r_iface, z_test)
-        # c_r = eval_at(u_inconel, bb_tree_inconel, mesh_inconel, r_iface, z_test)
+        c_l = eval_at(u_flibe, bb_tree_flibe, mesh_flibe, r_iface, z_test)
+        c_r = eval_at(u_inconel, bb_tree_inconel, mesh_inconel, r_iface, z_test)
 
-        # print(f"c_flibe          = {c_l}")
-        # print(f"c_inconel        = {c_r}")
-        # print(f"c_henry/K_H      = {c_l / K_flibe}")
-        # print(f"(c_sievert/K_S)^2 = {(c_r / K_inconel) ** 2}")
-        # print(
-        #     f"henry ratio            = {(c_l / K_flibe) / (c_r / K_inconel) ** 2:.4e}"
-        # )
+        print(f"c_flibe          = {c_l}")
+        print(f"c_inconel        = {c_r}")
+        print(f"c_henry/K_H      = {c_l / K_flibe}")
+        print(f"(c_sievert/K_S)^2 = {(c_r / K_inconel) ** 2}")
+        print(
+            f"henry ratio            = {(c_l / K_flibe) / (c_r / K_inconel) ** 2:.4e}"
+        )
 
         del model
         gc.collect()
