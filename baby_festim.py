@@ -43,7 +43,7 @@ class CylindricalSurfaceFlux(F.SurfaceFlux):
     Surface flux for a 2D axisymmetric (r, z) mesh.
 
     Computes:
-        J = integral(-D * grad(c) . n * r dS) * 2π
+        J = integral(-D * grad(c) . n * r dS) * 2*pi
     """
 
     azimuth_range: tuple = (0.0, 2 * np.pi)
@@ -88,6 +88,15 @@ class CylindricalSurfaceFlux(F.SurfaceFlux):
 #
 # He case:  J = Kr * c^2
 # H2 case:  J = Kr * c^2 + Kr * c_H2 * c
+#
+# NOTE on time dependence:
+#   FESTIM exports cannot access the symbolic simulation time inside compute()
+#   (the base-class attribute `self.t` is a Python list of recorded time stamps,
+#    not a dolfinx Constant). Therefore this export uses a FIXED h2_conc.
+#   For runs where the sweep-gas H2 level changes in time (e.g. He -> H2 at a
+#   switch time), we export TWO versions of each Inconel surface (one with
+#   h2_conc = 0 and one with h2_conc = the post-switch value) and stitch them
+#   together in post-processing at the switch time ("Method A").
 # ---------------------------------------------------------------------------
 
 
@@ -168,7 +177,7 @@ class CylindricalSurfaceFluxMassTransfer(F.SurfaceFlux):
         J_release = k * c
 
     Integrated release:
-        R = integral(k * c * 2πr dS)
+        R = integral(k * c * 2*pi*r dS)
     """
 
     azimuth_range: tuple = (0.0, 2 * np.pi)
@@ -209,7 +218,7 @@ class CylindricalSurfaceFluxMassTransfer(F.SurfaceFlux):
 class CylindricalTotalVolume(F.TotalVolume):
     """
     TotalVolume for 2D axisymmetric (r, z) mesh.
-    Computes: N = integral(u * 2π r dr dz) = real 3D inventory [particles]
+    Computes: N = integral(u * 2*pi r dr dz) = real 3D inventory [particles]
     """
 
     azimuth_range: tuple = (0.0, 2 * np.pi)
@@ -234,7 +243,7 @@ class CylindricalTotalVolume(F.TotalVolume):
 
 
 # ---------------------------------------------------------------------------
-# Fetch irradiation time
+# Run metadata and irradiation handling
 # ---------------------------------------------------------------------------
 RUN_URLS = {
     1: "https://raw.githubusercontent.com/LIBRA-project/BABY-1L-run-1/refs/tags/v0.6/data/processed_data.json",
@@ -243,18 +252,8 @@ RUN_URLS = {
     4: "https://raw.githubusercontent.com/LIBRA-project/BABY-1L-run-4/refs/tags/v0.1/data/processed_data.json",
 }
 
-
-def get_total_irradiation_time(run_id: int) -> float:
-    from libra_toolbox.tritium.model import ureg
-
-    url = RUN_URLS[run_id]
-    data = requests.get(url).json()
-    duration = 0
-    for irr in data["irradiations"]:
-        start = irr["start_time"]["value"] * ureg(irr["start_time"]["unit"])
-        end = irr["stop_time"]["value"] * ureg(irr["stop_time"]["unit"])
-        duration += (end - start).to(ureg("s")).magnitude
-    return duration
+# H2 switch time for the He_then_H2 runs [seconds]: sweep gas changes at day 19.
+T_SWITCH_H2 = 19 * 86400
 
 
 def get_total_measurement_time(run_id: int) -> float:
@@ -282,7 +281,59 @@ def get_total_measurement_time(run_id: int) -> float:
     return t_max
 
 
-# Total tritium production per run [particles] — Table 2 from BABY-1L paper, last column
+def get_irradiation_segments(run_id: int):
+    """
+    Return list of (t_start, t_end) tuples in SECONDS for each
+    irradiation segment of this run. Handles multi-segment irradiations
+    (e.g. run 4 has two irradiation campaigns).
+    """
+    from libra_toolbox.tritium.model import ureg
+
+    url = RUN_URLS[run_id]
+    data = requests.get(url).json()
+    segments = []
+    for irr in data["irradiations"]:
+        start = (
+            (irr["start_time"]["value"] * ureg(irr["start_time"]["unit"]))
+            .to(ureg("s"))
+            .magnitude
+        )
+        stop = (
+            (irr["stop_time"]["value"] * ureg(irr["stop_time"]["unit"]))
+            .to(ureg("s"))
+            .magnitude
+        )
+        segments.append((start, stop))
+    return segments
+
+
+def make_tritium_source(run_id):
+    """
+    Build a time-dependent tritium source that is active only during the
+    actual irradiation segments of this run.
+
+    The source strength is normalised by the TOTAL irradiation duration so that
+    the time-integral of the source over all segments equals
+    TRITIUM_PRODUCTION[run_id], regardless of how many segments there are.
+
+    Note: ParticleSource passes a NUMERICAL time `t` to the value function,
+    so a plain Python `if` over the segments is valid here.
+    """
+    segments = get_irradiation_segments(run_id)
+
+    total_irr_duration = sum(end - start for start, end in segments)
+    source_strength = TRITIUM_PRODUCTION[run_id] / (total_irr_duration * V_CLLIF)
+
+    def tritium_source(t):
+        for t_start, t_end in segments:
+            if t_start <= t <= t_end:
+                return source_strength
+        return 0.0
+
+    return tritium_source, source_strength, segments
+
+
+# Total tritium production per run [particles] - Table 2 from BABY-1L paper, last column
 TRITIUM_PRODUCTION = {
     1: 9.45e9,
     2: 5.36e10,
@@ -290,7 +341,7 @@ TRITIUM_PRODUCTION = {
     4: 1.81e10,
 }
 
-# CLLiF volume [m^3] — nominal 1 L
+# CLLiF volume [m^3] - nominal 1 L
 V_CLLIF = 1.0e-3
 
 # ---------------------------------------------------------------------------
@@ -385,19 +436,31 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     """
     Build the 2D axisymmetric FESTIM model.
 
-    sweep_gas : "He" or "H2"
+    sweep_gas : "He", "H2", or "He_then_H2"
+        "He"          : pure helium for the whole run (Kr*c^2 recombination).
+        "H2"          : constant H2 in the sweep gas (Kr*c^2 + Kr*c_H2*c).
+        "He_then_H2"  : pure He until T_SWITCH_H2, then H2 turns on
+                        (handled with a UFL conditional in the BC, and with the
+                         two-version "Method A" stitching in the exports).
     """
 
-    irradiation_time = get_total_irradiation_time(run_id)
     measurement_time = get_total_measurement_time(run_id)
 
-    # Average volumetric production rate during irradiation [T / m^3 / s]
-    source_strength = TRITIUM_PRODUCTION[run_id] / (irradiation_time * V_CLLIF)
-    # print(f"  Run {run_id}: source = {source_strength:.3e} T/m^3/s")
-    # exit(0)
+    # --- Time-dependent source over the real irradiation segments ---
+    tritium_source, source_strength, irr_segments = make_tritium_source(run_id)
 
-    def tritium_source(t):
-        return source_strength if t <= irradiation_time else 0.0
+    # Force the time-stepper to land exactly on every irradiation boundary
+    # (and on the H2 switch time for the He_then_H2 runs) so the solver does not
+    # step across a discontinuity in a single large step.
+    source_milestones = []
+    for t_start, t_end in irr_segments:
+        source_milestones.append(t_start)
+        source_milestones.append(t_end)
+
+    milestones = sorted(set(source_milestones))
+    if sweep_gas == "He_then_H2":
+        milestones.append(T_SWITCH_H2)
+        milestones = sorted(set(milestones))
 
     model = F.HydrogenTransportProblemDiscontinuous()
 
@@ -489,11 +552,14 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     ]
 
     # -----------------------------------------------------------------------
-    # Recombination boundary conditions on outer Inconel surfaces
+    # Recombination boundary conditions on the Inconel-gas surfaces.
+    #
+    # `h2_late` is the H2 number density that is "on" during the H2 phase.
+    # It is reused below to build the post-switch export version (Method A).
     # -----------------------------------------------------------------------
 
     if sweep_gas == "H2":
-        h2_conc = compute_h2_conc()
+        h2_late = compute_h2_conc()
 
         def make_recomb_flux(h2_conc):
             def flux(c, T):
@@ -502,29 +568,29 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
             return flux
 
-        recombination_flux = make_recomb_flux(h2_conc)
+        recombination_flux = make_recomb_flux(h2_late)
 
     elif sweep_gas == "He":
-        h2_conc = 0.0
+        h2_late = 0.0
 
         def recombination_flux(c, T):
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
             return -Kr * c**2
 
     elif sweep_gas == "He_then_H2":
-        h2_steady = compute_h2_conc()
-        t_switch = 19 * 86400
+        h2_late = compute_h2_conc()
 
         def recombination_flux(c, T, t):
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
-            # UFL symbolic conditional instead of Python if
-            h2 = ufl.conditional(ufl.ge(t, t_switch), h2_steady, 0.0)
+            # UFL symbolic conditional: H2 turns on at T_SWITCH_H2.
+            # `t` here is the symbolic simulation time supplied by FESTIM.
+            h2 = ufl.conditional(ufl.ge(t, T_SWITCH_H2), h2_late, 0.0)
             return -Kr * c**2 - Kr * h2 * c
 
-        h2_conc = 0.0
-
     else:
-        raise ValueError(f"Unknown sweep_gas '{sweep_gas}'. Use 'He' or 'H2'.")
+        raise ValueError(
+            f"Unknown sweep_gas '{sweep_gas}'. Use 'He', 'H2', or 'He_then_H2'."
+        )
 
     subfolder = f"{results_folder}/run_{run_id}/sweep_{sweep_gas}"
 
@@ -604,7 +670,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         growth_factor=1.1,
         cutback_factor=0.9,
         target_nb_iterations=4,
-        milestones=[irradiation_time],
+        milestones=milestones,
     )
 
     model.settings = F.Settings(
@@ -619,8 +685,10 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     # Exports
     # -----------------------------------------------------------------------
 
-    # Helper to build a recomb-eq flux export for a given outer surface
-    def make_recomb_eq_export(surface, name, filename):
+    # Helper to build a recomb-eq flux export for a given Inconel surface,
+    # using a FIXED h2 value (see the note on the export class for why a fixed
+    # value is required).
+    def make_recomb_eq_export(surface, name, filename, h2_value):
         return CylindricalSurfaceFluxFromEquation(
             field=T,
             surface=surface,
@@ -629,9 +697,62 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             inconel_Kr_0=inconel_Kr_0,
             inconel_E_Kr=inconel_E_Kr,
             temperature=temperature_K,
-            h2_conc=h2_conc,  # 0.0 for He, real value for H2
+            h2_conc=h2_value,
             name=name,
         )
+
+    # All Inconel-gas surfaces (inner walls feeding IV + outer walls feeding OV)
+    # for which we report the physical (recombination) release rate.
+    inconel_surfs = [
+        (inconel_outer_bottom, "inconel_outer_bottom"),
+        (inconel_outer_side, "inconel_outer_side"),
+        (inconel_outer_top, "inconel_outer_top"),
+        (gap_sidewall, "gap_sidewall"),
+        (top_cap, "top_cap"),
+    ]
+
+    # -----------------------------------------------------------------------
+    # Method A (two-version export) for time-varying H2.
+    #
+    #   - He_then_H2 runs: export TWO files per surface,
+    #         flux_<surface>_h0.csv  (computed with h2 = 0,      valid t < switch)
+    #         flux_<surface>_h2.csv  (computed with h2 = h2_late, valid t >= switch)
+    #     Post-processing stitches them at T_SWITCH_H2.
+    #
+    #   - He / H2 runs (constant sweep gas): export a SINGLE file per surface,
+    #         flux_<surface>_recomb_eq.csv
+    #     with the constant h2 value used by the BC (0.0 for He, h2_late for H2).
+    # -----------------------------------------------------------------------
+    recomb_eq_exports = []
+    if sweep_gas == "He_then_H2":
+        for surf, sname in inconel_surfs:
+            recomb_eq_exports.append(
+                make_recomb_eq_export(
+                    surf,
+                    f"{sname} (h2=0)",
+                    f"{subfolder}/flux_{sname}_h0.csv",
+                    h2_value=0.0,
+                )
+            )
+            recomb_eq_exports.append(
+                make_recomb_eq_export(
+                    surf,
+                    f"{sname} (h2=on)",
+                    f"{subfolder}/flux_{sname}_h2.csv",
+                    h2_value=h2_late,
+                )
+            )
+    else:
+        # Constant sweep gas: a single fixed h2 value matches the BC exactly.
+        for surf, sname in inconel_surfs:
+            recomb_eq_exports.append(
+                make_recomb_eq_export(
+                    surf,
+                    sname,
+                    f"{subfolder}/flux_{sname}_recomb_eq.csv",
+                    h2_value=h2_late,
+                )
+            )
 
     model.exports = [
         # Concentration fields
@@ -660,6 +781,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         #     filename=f"{subfolder}/flux_gap_sidewall.csv",
         #     name="Inconel gap sidewall",
         # ),
+        # ---- Liquid free surface release (mass-transfer law J = k c, IV-bound) ----
         CylindricalSurfaceFluxMassTransfer(
             field=T,
             surface=liquid_surface,
@@ -699,32 +821,9 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         #     filename=f"{subfolder}/flux_inconel_outer_top.csv",
         #     name="Inconel outer top",
         # ),
-        # # ---- Recomb-eq (physical release) fluxes on all 3 outer surfaces ----
-        make_recomb_eq_export(
-            inconel_outer_bottom,
-            "Inconel outer bottom",
-            f"{subfolder}/flux_inconel_outer_bottom_recomb_eq.csv",
-        ),
-        make_recomb_eq_export(
-            inconel_outer_side,
-            "Inconel outer side",
-            f"{subfolder}/flux_inconel_outer_side_recomb_eq.csv",
-        ),
-        make_recomb_eq_export(
-            inconel_outer_top,
-            "Inconel outer top",
-            f"{subfolder}/flux_inconel_outer_top_recomb_eq.csv",
-        ),
-        make_recomb_eq_export(
-            gap_sidewall,
-            "gap sidewall",
-            f"{subfolder}/flux_gap_sidewall.csv",
-        ),
-        make_recomb_eq_export(
-            top_cap,
-            "top cap",
-            f"{subfolder}/flux_inconel_top_cap.csv",
-        ),
+        # ---- Recomb-eq (physical release) fluxes on all Inconel surfaces ----
+        # (single version for He/H2, two-version h0/h2 for He_then_H2)
+        *recomb_eq_exports,
         # ---- Tritium inventory per region ----
         CylindricalTotalVolume(
             field=T, volume=vol_cllif, filename=f"{subfolder}/inventory_cllif.csv"
@@ -744,15 +843,29 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
 
 if __name__ == "__main__":
-    for run_id in [2]:
+    # Sweep-gas schedule per run.
+    #   run 1, 2 : pure He for the whole run.
+    #   run 3    : He, then 1000 ppm H2 switched on at day 19.
+    #   run 4    : H2 sweep. NOTE: experimentally run 4 is 1000 ppm H2 from the
+    #              start, then switched to a higher H2 level at day 19. The
+    #              current "H2" branch treats it as a CONSTANT H2 sweep at the
+    #              compute_h2_conc() value. A dedicated two-stage-H2 treatment
+    #              (low -> high) is a separate TODO.
+    RUN_SWEEP = {
+        1: "He",
+        2: "He",
+        3: "He_then_H2",
+        4: "H2",
+    }
+
+    for run_id in [1]:
         # for run_id in [1, 2, 4]:
-        print(f"\n=== Run {run_id} / He sweep ===")
+        sweep = RUN_SWEEP[run_id]
+        print(f"\n=== Run {run_id} / {sweep} sweep ===")
         # set_log_level(LogLevel.INFO)
         # model = build_model(sweep_gas="He", run_id=run_id)
-        model, T, vol_cllif, vol_inconel = build_model(sweep_gas="He", run_id=run_id)
-        # model, T, vol_cllif, vol_inconel = build_model(
-        #     sweep_gas="He_then_H2", run_id=run_id
-        # )
+        # model, T, vol_cllif, vol_inconel = build_model(sweep_gas="He", run_id=run_id)
+        model, T, vol_cllif, vol_inconel = build_model(sweep_gas=sweep, run_id=run_id)
         model.initialise()
         model.run()
 
