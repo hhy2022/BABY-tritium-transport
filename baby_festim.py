@@ -118,6 +118,7 @@ class CylindricalSurfaceFluxFromEquation(F.SurfaceFlux):
         inconel_E_Kr,
         temperature,
         h2_conc=0.0,  # H2 concentration [m^-3], or a function h2_conc(t)
+        kex_0=None,  # exchange coeff [m^4/s/atom]; None -> use Kr (Inconel case)
         name=None,
     ):
         super().__init__(field=field, surface=surface, filename=filename)
@@ -126,6 +127,7 @@ class CylindricalSurfaceFluxFromEquation(F.SurfaceFlux):
         self.inconel_E_Kr = inconel_E_Kr
         self.temperature = temperature
         self.h2_conc = h2_conc
+        self.kex_0 = kex_0
         self.time_constant = None
         self._name = name
 
@@ -170,9 +172,12 @@ class CylindricalSurfaceFluxFromEquation(F.SurfaceFlux):
 
         h2_conc = self._current_h2_conc()
 
-        # Physical release: T+T -> T2  plus  T+H -> HT (if H2 present)
+        # Exchange coeff: separate kex_0 if given (liquid), else Kr (Inconel).
+        kex = self.kex_0 if self.kex_0 is not None else Kr
+
+        # Physical release: T+T -> T2 (recomb)  plus  T+H -> HT (exchange, if H2)
         # Both terms are non-negative since c >= 0 and h2_conc >= 0
-        integrand = Kr * u**2 + Kr * h2_conc * u
+        integrand = Kr * u**2 + kex * h2_conc * u
 
         flux = assemble_scalar(
             fem.form(
@@ -201,13 +206,30 @@ class CylindricalSurfaceFluxMassTransfer(F.SurfaceFlux):
 
     def __init__(self, field, surface, filename, k, name=None):
         super().__init__(field=field, surface=surface, filename=filename)
+        # k may be a constant [m/s] or a time-dependent function k(t) (used to
+        # carry the H2 isotopic-exchange enhancement k_eff(t) = k_d + k_ex*c_H).
         self.k = k
         self._name = name
+        self.time_constant = None
 
     @property
     def title(self):
         label = self._name if self._name else f"surface {self.surface.id}"
         return f"{self.field.name} mass-transfer release {label}"
+
+    def bind_time_constant(self, time_constant):
+        self.time_constant = time_constant
+
+    def _current_k(self):
+        if callable(self.k):
+            if self.time_constant is None:
+                raise RuntimeError(
+                    "A time-dependent k requires bind_time_constant()."
+                )
+            value = self.time_constant.value
+            t = float(value[0] if np.ndim(value) > 0 else value)
+            return float(self.k(t))
+        return float(self.k)
 
     def compute(self, u, ds, entity_maps=None):
         from scifem import assemble_scalar
@@ -220,9 +242,11 @@ class CylindricalSurfaceFluxMassTransfer(F.SurfaceFlux):
         x = ufl.SpatialCoordinate(mesh)
         r = x[0]
 
+        k = self._current_k()
+
         flux = assemble_scalar(
             fem.form(
-                self.k * u * r * ds(self.surface.id),
+                k * u * r * ds(self.surface.id),
                 entity_maps=entity_maps,
             )
         )
@@ -373,6 +397,10 @@ htm_D_flibe = htm.diffusivities.filter(material="flibe").filter(author="calderon
 htm_S_flibe = htm.solubilities.filter(material="flibe").filter(author="calderoni")
 
 flibe_D_0 = htm_D_flibe[0].pre_exp.magnitude
+# MIXED diffusion/surface control: D gives L^2/D ~ release window so the salt
+# retains a bulk reservoir (-> fast sqrt(t)-like early rise AND deep T left at
+# day 19 for the H2 exchange to mobilize). NOT well-mixed (that killed the fast
+# early rise); NOT the old k=1e5 pure-diffusion sink (exchange then does nothing).
 flibe_D_0 *= 0.35
 flibe_E_D = htm_D_flibe[0].act_energy.magnitude
 flibe_S_0 = htm_S_flibe[0].pre_exp.magnitude * 1e15
@@ -433,20 +461,78 @@ rtol = 1e-6
 # ---------------------------------------------------------------------------
 
 
-def compute_h2_conc():
-    """Compute H2 number density in the sweep gas [m^-3]."""
+def compute_p_h2(h2_conc_ppm=1000):
+    """H2 partial pressure in the sweep gas [Pa] for a given H2 fraction [ppm]."""
     h2_P_gauge = 10  # psi (gauge)
-    h2_conc_ppm = 1000  # ppm H2 in sweep gas
     mole_frac_h2 = h2_conc_ppm / 1e6
     P_atm = 14.7
     P_abs = h2_P_gauge + P_atm
     P_h2 = mole_frac_h2 * P_abs
     P_h2 *= 6894.76  # psi -> Pa
-    gas_constant = 8.314
-    T_room = 298
-    h2_conc_mol = P_h2 / (gas_constant * T_room)  # mol/m^3
-    h2_conc = h2_conc_mol * 6.022e23  # m^-3
-    return h2_conc
+    return P_h2
+
+
+def compute_h2_conc(h2_conc_ppm=1000):
+    """Dissolved atomic H concentration at the Inconel surface [m^-3].
+
+    The isotopic-exchange recombination term is Kr * c_H * c, where Kr is the
+    Inconel surface recombination coefficient and both c (dissolved T) and c_H
+    must be DISSOLVED ATOMIC concentrations in the metal [atoms/m^3] for the
+    units to match. The H partner in Sievert equilibrium with the sweep-gas
+    H2 partial pressure is therefore
+
+        c_H = K_s,inconel * sqrt(p_H2)
+
+    NOT the gas-phase H2 molecular number density. Crucially this makes the
+    exchange term scale as sqrt(p_H2) (so 1000 ppm -> 3.5% is x sqrt(35) ~ 5.9),
+    not linearly in p_H2.
+    """
+    P_h2 = compute_p_h2(h2_conc_ppm)
+    return K_inconel * np.sqrt(P_h2)
+
+
+# Legacy (physically inconsistent) version: gas-phase H2 molecular number
+# density [m^-3]. Kept for reference / quick A-B comparison.
+# def compute_h2_conc(h2_conc_ppm=1000):
+#     P_h2 = compute_p_h2(h2_conc_ppm)
+#     gas_constant = 8.314
+#     T_room = 298
+#     h2_conc_mol = P_h2 / (gas_constant * T_room)  # mol/m^3
+#     return h2_conc_mol * 6.022e23  # m^-3
+
+
+# ---------------------------------------------------------------------------
+# Liquid (CLLiF) free-surface release: LINEAR desorption + isotopic exchange.
+#
+#       J = (k_d + k_ex * c_H) * c
+#
+# Linear in c -> the release timescale is INDEPENDENT of inventory c0, so a
+# single k_d fits runs of different total production consistently (unlike c^2,
+# whose c0-dependence made run 3's higher-inventory He phase release too fast
+# and overshoot). Run in the MIXED-control regime: D*0.35 (diffusion-influenced,
+# Biot ~2.6) gives the fast early rise, while k_d is finite (not the old k=1e5
+# diffusion sink) so the surface partially limits and the H2 exchange term
+# k_ex*c_H actually boosts release -> a visible day-19 switch. c_H = K_H*p_H2
+# (Henry, linear in p). k_ex is tuned for the switch strength.
+# ---------------------------------------------------------------------------
+
+# Fitted liquid free-surface coefficients.
+LIQUID_KD = 8e-8  # desorption coeff [m/s] -- FITTED (He channel, runs 1&2 magnitude).
+LIQUID_KEX = 4e-30  # isotopic-exchange coeff [m^4/s/atom] -- FITTED (H2 switch strength).
+
+# Physical (un-fudged) CLLiF Henry solubility for the H-partner concentration.
+# flibe_S_0 carries a x1e15 numerical-penalty scaling (see Material props); that
+# scaling is for the interface jump, not a physical solubility, so divide it out
+# here to get a meaningful dissolved-H concentration.
+K_flibe_phys = (flibe_S_0 / 1e15) * np.exp(-flibe_E_S / (8.617e-5 * temperature_K))
+
+
+def compute_h2_conc_henry(h2_conc_ppm=1000):
+    """Dissolved H concentration in CLLiF [m^-3] via Henry's law:
+        c_H = K_H * p_H2        (LINEAR in p_H2)
+    Used as the isotopic-exchange partner for the liquid free-surface release.
+    """
+    return K_flibe_phys * compute_p_h2(h2_conc_ppm)
 
 
 # ---------------------------------------------------------------------------
@@ -576,19 +662,19 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     # -----------------------------------------------------------------------
     # Recombination boundary conditions on the Inconel-gas surfaces.
     #
-    # `h2_late` is the H2 number density that is "on" during the H2 phase.
+    # `h2_late` is the dissolved atomic-H concentration that is "on" during
+    # the H2 phase (Sievert: c_H = K_s,inconel*sqrt(p_H2)).
     # It is reused below to build the post-switch export version (Method A).
     # -----------------------------------------------------------------------
 
     if sweep_gas == "H2":
         # Run 4 physical schedule: 1000 ppm H2 from t=0, switched to 3.5%
-        # (35000 ppm = 35 x base) at T_SWITCH_H2. compute_h2_conc() returns the
-        # 1000 ppm number density; multiplying by 35 gives the 3.5% value at
-        # unchanged sweep-gas pressure.
-        # TEST: lower h2_early to ~50 ppm (full/20) to match exp pre-day-19 OV
-        # slope (~0.15 Bq/day). h2_late kept at 3.5% (35× nominal full).
-        h2_early = compute_h2_conc() / 30  # was: compute_h2_conc()
-        h2_late = compute_h2_conc() * 35  # was: h2_early * 35 — keep 3.5% target
+        # (35000 ppm) at T_SWITCH_H2. compute_h2_conc(ppm) now returns the
+        # DISSOLVED atomic-H concentration c_H = K_s,inconel*sqrt(p_H2), so the
+        # pressure step from 1000 ppm -> 3.5% scales c_H by sqrt(35) ~ 5.9
+        # (was an unphysical x35 with the old gas-number-density formulation).
+        h2_early = compute_h2_conc(1000)  # was: compute_h2_conc() / 30
+        h2_late = compute_h2_conc(35000)  # was: compute_h2_conc() * 35
 
         def recombination_flux(c, T, t):
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
@@ -630,6 +716,49 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     else:
         h2_conc_export = h2_late
 
+    # -----------------------------------------------------------------------
+    # Liquid (CLLiF) free-surface release: LINEAR desorption + isotopic exchange.
+    #   J = (k_d + k_ex * c_H) * c
+    # Linear in c (Henry/molecular T2 desorption; exchange T2+H2->2HT also needs
+    # only one T). c_H = K_H * p_H2 (Henry, linear in p).
+    # -----------------------------------------------------------------------
+    if sweep_gas == "H2":
+        h2_early_liq = compute_h2_conc_henry(1000)
+        h2_late_liq = compute_h2_conc_henry(35000)
+
+        def liquid_surface_flux(c, T, t):
+            c_H = ufl.conditional(ufl.ge(t, T_SWITCH_H2), h2_late_liq, h2_early_liq)
+            return -(LIQUID_KD + LIQUID_KEX * c_H) * c
+
+    elif sweep_gas == "He":
+        h2_late_liq = 0.0
+
+        def liquid_surface_flux(c, T):
+            return -LIQUID_KD * c
+
+    elif sweep_gas == "He_then_H2":
+        h2_late_liq = compute_h2_conc_henry(1000)
+
+        def liquid_surface_flux(c, T, t):
+            c_H = ufl.conditional(ufl.ge(t, T_SWITCH_H2), h2_late_liq, 0.0)
+            return -(LIQUID_KD + LIQUID_KEX * c_H) * c
+
+    # k_eff(t) = k_d + k_ex*c_H(t) [m/s] for the export, J = k_eff(t)*c.
+    if sweep_gas == "He_then_H2":
+
+        def liquid_keff_export(t):
+            c_H = h2_late_liq if t >= T_SWITCH_H2 else 0.0
+            return LIQUID_KD + LIQUID_KEX * c_H
+
+    elif sweep_gas == "H2":
+
+        def liquid_keff_export(t):
+            c_H = h2_late_liq if t >= T_SWITCH_H2 else h2_early_liq
+            return LIQUID_KD + LIQUID_KEX * c_H
+
+    else:
+        liquid_keff_export = LIQUID_KD
+
     subfolder = f"{results_folder}/run_{run_id}/sweep_{sweep_gas}"
 
     # -----------------------------------------------------------------------
@@ -666,38 +795,36 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         bc._volume_subdomain = vol_inconel
         recomb_bcs.append(bc)
 
-    # inner_vessel_surfaces = [liquid_surface, gap_sidewall, top_cap]
+    # Liquid free-surface release: linear desorption + isotopic exchange
+    # J = -(k_d + k_ex*c_H)*c  (surface-limited regime; large flibe D).
+    liquid_recomb_bc = F.ParticleFluxBC(
+        value=liquid_surface_flux,
+        subdomain=liquid_surface,
+        species_dependent_value={"c": T},
+        species=T,
+    )
+    liquid_recomb_bc._volume_subdomain = vol_cllif
 
-    # model.boundary_conditions = [
-    #     *[
-    #         F.FixedConcentrationBC(subdomain=surf, species=T, value=0.0)
-    #         for surf in inner_vessel_surfaces
-    #     ],
-    #     *recomb_bcs,
-    # ]
-    def mass_transfer_flux(k):
-        def flux(c, T):
-            return -k * c
-
-        return flux
-
-    mass_transfer_bcs = []
-
-    for surf, k_val in [
-        (liquid_surface, k_release["liquid_surface"]),
-        # (gap_sidewall, k_release["gap_sidewall"]),
-        # (top_cap, k_release["top_cap"]),
-    ]:
-        bc = F.ParticleFluxBC(
-            value=mass_transfer_flux(k_val),
-            subdomain=surf,
-            species_dependent_value={"c": T},
-            species=T,
-        )
-        mass_transfer_bcs.append(bc)
+    # --- Legacy first-order mass-transfer BC on the liquid free surface ---
+    # def mass_transfer_flux(k):
+    #     def flux(c, T):
+    #         return -k * c
+    #     return flux
+    #
+    # mass_transfer_bcs = []
+    # for surf, k_val in [
+    #     (liquid_surface, k_release["liquid_surface"]),
+    # ]:
+    #     bc = F.ParticleFluxBC(
+    #         value=mass_transfer_flux(k_val),
+    #         subdomain=surf,
+    #         species_dependent_value={"c": T},
+    #         species=T,
+    #     )
+    #     mass_transfer_bcs.append(bc)
 
     model.boundary_conditions = [
-        *mass_transfer_bcs,
+        liquid_recomb_bc,
         *recomb_bcs,
     ]
 
@@ -842,14 +969,23 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         #     filename=f"{subfolder}/flux_gap_sidewall.csv",
         #     name="Inconel gap sidewall",
         # ),
-        # ---- Liquid free surface release (mass-transfer law J = k c, IV-bound) ----
+        # ---- Liquid free surface release (linear desorption + exchange, IV-bound) ----
+        # J = (k_d + k_ex*c_H)*c = k_eff(t)*c.
         CylindricalSurfaceFluxMassTransfer(
             field=T,
             surface=liquid_surface,
             filename=f"{subfolder}/flux_liquid_surface.csv",
-            k=k_release["liquid_surface"],
+            k=liquid_keff_export,
             name="liquid surface",
         ),
+        # ---- Legacy mass-transfer export (J = k c) ----
+        # CylindricalSurfaceFluxMassTransfer(
+        #     field=T,
+        #     surface=liquid_surface,
+        #     filename=f"{subfolder}/flux_liquid_surface.csv",
+        #     k=k_release["liquid_surface"],
+        #     name="liquid surface",
+        # ),
         # CylindricalSurfaceFluxMassTransfer(
         #     field=T,
         #     surface=gap_sidewall,
@@ -915,8 +1051,8 @@ if __name__ == "__main__":
         4: "H2",
     }
 
-    for run_id in [1, 2, 3, 4]:
-        # for run_id in [4]:  # iter 15: test h2_early /100 effect on run 4 OV shape
+    # for run_id in [1, 2, 3, 4]:
+    for run_id in [1, 3]:  # mixed-control test: run 1 (He early phase) + run 3 (switch)
         sweep = RUN_SWEEP[run_id]
         print(f"\n=== Run {run_id} / {sweep} sweep ===")
         # set_log_level(LogLevel.INFO)
