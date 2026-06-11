@@ -88,15 +88,23 @@ def generate_baby_upper_2d_mesh(
 
     occ.synchronize()
 
+    # Merge the two CLLiF rectangles into one surface so the salt has no
+    # internal seam line. They are only split because of the heater-well notch;
+    # physically it is a single domain. NOTE: removing the seam drops two curves,
+    # which shifts some OCC curve tags — the hardcoded boundary tags below were
+    # remapped accordingly (verify with: python baby_mesh.py after edits).
+    fused_cllif, _ = occ.fuse(
+        [(2, surfaces["cllif_lower"])], [(2, surfaces["cllif_upper"])]
+    )
+    occ.synchronize()
+
     all_objects = [
         (2, surfaces["IV_bottom"]),
         (2, surfaces["IV_wall"]),
         (2, surfaces["IV_top"]),
-        (2, surfaces["cllif_lower"]),
-        (2, surfaces["cllif_upper"]),
         # (2, surfaces["heater"]),
         # (2, surfaces["helium_box"]),
-    ]
+    ] + [(2, tag) for (dim, tag) in fused_cllif]
     occ.fragment(all_objects, [])
     occ.synchronize()
 
@@ -204,7 +212,7 @@ def generate_baby_upper_2d_mesh(
     gmsh.model.setPhysicalName(1, inconel_outer_bottom, "inconel_outer_bottom")
     inconel_outer_side = gmsh.model.addPhysicalGroup(1, [2, 6], tag=32)
     gmsh.model.setPhysicalName(1, inconel_outer_side, "inconel_outer_side")
-    inconel_outer_top = gmsh.model.addPhysicalGroup(1, [12, 13], tag=33)
+    inconel_outer_top = gmsh.model.addPhysicalGroup(1, [11, 12], tag=33)
     gmsh.model.setPhysicalName(1, inconel_outer_top, "inconel_outer_top")
 
     left_symmetry_liquid = gmsh.model.addPhysicalGroup(1, [17], tag=21)
@@ -213,22 +221,22 @@ def generate_baby_upper_2d_mesh(
     left_symmetry_inconel = gmsh.model.addPhysicalGroup(1, [5], tag=22)
     gmsh.model.setPhysicalName(1, left_symmetry_inconel, "left_symmetry_inconel")
 
-    top_cap_bc = gmsh.model.addPhysicalGroup(1, [11], tag=11)
+    top_cap_bc = gmsh.model.addPhysicalGroup(1, [10], tag=11)
     gmsh.model.setPhysicalName(1, top_cap_bc, "top_cap_bc")
 
     gap_sidewall_bc = gmsh.model.addPhysicalGroup(1, [8], tag=12)
     gmsh.model.setPhysicalName(1, gap_sidewall_bc, "gap_sidewall_bc")
 
-    liquid_surface_bc = gmsh.model.addPhysicalGroup(1, [18], tag=13)
+    liquid_surface_bc = gmsh.model.addPhysicalGroup(1, [14], tag=13)
     gmsh.model.setPhysicalName(1, liquid_surface_bc, "liquid_surface_bc")
 
-    heater_cap_bc = gmsh.model.addPhysicalGroup(1, [14], tag=14)
+    heater_cap_bc = gmsh.model.addPhysicalGroup(1, [13], tag=14)
     gmsh.model.setPhysicalName(1, heater_cap_bc, "heater_cap_bc")
 
     # heater_gap_bc = gmsh.model.addPhysicalGroup(1, [20], tag=15)
     # gmsh.model.setPhysicalName(1, heater_gap_bc, "heater_gap_bc")
 
-    liquid_heater_interface_bc = gmsh.model.addPhysicalGroup(1, [16, 19], tag=16)
+    liquid_heater_interface_bc = gmsh.model.addPhysicalGroup(1, [16, 15], tag=16)
     gmsh.model.setPhysicalName(
         1, liquid_heater_interface_bc, "liquid_heater_interface_bc"
     )
@@ -288,7 +296,7 @@ def generate_baby_upper_2d_mesh(
 
     # Refine mesh near the liquid surface
     f_dist_liquid = gmsh.model.mesh.field.add("Distance")
-    gmsh.model.mesh.field.setNumbers(f_dist_liquid, "CurvesList", [18])
+    gmsh.model.mesh.field.setNumbers(f_dist_liquid, "CurvesList", [14])
 
     f_thresh_liquid = gmsh.model.mesh.field.add("Threshold")
     gmsh.model.mesh.field.setNumber(f_thresh_liquid, "InField", f_dist_liquid)
@@ -310,6 +318,9 @@ def generate_baby_upper_2d_mesh(
     gmsh.write(fname)
 
     if show_gui:
+        # Hide point markers (geometry vertices and mesh nodes) in the GUI.
+        gmsh.option.setNumber("Geometry.Points", 0)
+        gmsh.option.setNumber("Mesh.Points", 0)
         gmsh.fltk.run()
 
     gmsh.finalize()
