@@ -284,6 +284,81 @@ class CylindricalTotalVolume(F.TotalVolume):
 
 
 # ---------------------------------------------------------------------------
+# Bound-tritium (TF) -> mobile conversion, rate prop. to p_H2(t).
+#
+# One-way volumetric reaction in the CLLiF:  T_bound --kappa(t)--> T
+# kappa(t) follows the run's H2 schedule (0 under pure He). Implemented as a
+# Reaction subclass whose rate is a UFL conditional on the model time, bound by
+# TimeAwareProblem before the formulation is assembled (same pattern as the
+# trap version, see baby_festim_trap.py).
+# ---------------------------------------------------------------------------
+
+
+class H2ConversionReaction(F.Reaction):
+    """T_bound -> T at rate kappa(t)*c_bound, kappa stepping at t_switch."""
+
+    def __init__(self, *args, kappa_early=0.0, kappa_late=0.0, t_switch=0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kappa_early = kappa_early
+        self.kappa_late = kappa_late
+        self.t_switch = t_switch
+        self.time_constant = None  # bound to model.t before formulation build
+
+    def reaction_term(
+        self, temperature, reactant_concentrations=None, product_concentrations=None
+    ):
+        if self.time_constant is not None:
+            # Strict > : with implicit Euler the step ending exactly at t_switch
+            # covers (t_prev, t_switch], which is entirely BEFORE the switch.
+            kappa = ufl.conditional(
+                ufl.gt(self.time_constant, self.t_switch),
+                self.kappa_late,
+                self.kappa_early,
+            )
+        else:
+            kappa = self.kappa_early
+
+        reactants = self.reactant
+        if reactant_concentrations is not None:
+            rc = [
+                reactant_concentrations[i]
+                if reactant_concentrations[i] is not None
+                else r.concentration
+                for i, r in enumerate(reactants)
+            ]
+        else:
+            rc = [r.concentration for r in reactants]
+
+        c_bound = rc[0]
+        for x in rc[1:]:
+            c_bound = c_bound * x
+
+        return kappa * c_bound
+
+
+class TimeAwareProblem(F.HydrogenTransportProblemDiscontinuous):
+    """Binds the model time constant into any time-dependent reaction before
+    the variational formulation is assembled (model.t exists by then)."""
+
+    def create_subdomain_formulation(self, subdomain):
+        for rxn in self.reactions:
+            if hasattr(rxn, "time_constant"):
+                rxn.time_constant = self.t
+        # Upstream fetches source.species' test function on EVERY subdomain
+        # before checking source.volume; a species absent from this subdomain
+        # (e.g. T_bound, CLLiF-only) raises KeyError. Temporarily hide sources
+        # whose species does not live on this subdomain.
+        all_sources = self.sources
+        self.sources = [
+            s for s in all_sources if subdomain in s.species.subdomains
+        ]
+        try:
+            return super().create_subdomain_formulation(subdomain)
+        finally:
+            self.sources = all_sources
+
+
+# ---------------------------------------------------------------------------
 # Run metadata and irradiation handling
 # ---------------------------------------------------------------------------
 RUN_URLS = {
@@ -294,7 +369,13 @@ RUN_URLS = {
 }
 
 # H2 switch time for the He_then_H2 runs [seconds]: sweep gas changes at day 19.
-T_SWITCH_H2 = 19 * 86400
+# Exact per-run H2 switch times, computed from each run's general.json:
+# gas_switch_time minus the first irradiation (generator) start.
+#   run 3: 4/4/2025 15:06 - 3/17/2025 10:03 = day 18.210
+#   run 4: 5/18/2025 19:58 - 5/1/2025 11:07 = day 17.369
+# The old hardcoded value (19 d) was ~0.8-1.6 d late.
+T_SWITCH_H2_BY_RUN = {3: 18.210 * 86400, 4: 17.369 * 86400}
+T_SWITCH_H2 = 19 * 86400  # legacy default for runs not listed above
 
 
 def get_total_measurement_time(run_id: int) -> float:
@@ -397,13 +478,20 @@ htm_D_flibe = htm.diffusivities.filter(material="flibe").filter(author="calderon
 htm_S_flibe = htm.solubilities.filter(material="flibe").filter(author="calderoni")
 
 flibe_D_0 = htm_D_flibe[0].pre_exp.magnitude
-# MIXED diffusion/surface control: D gives L^2/D ~ release window so the salt
-# retains a bulk reservoir (-> fast sqrt(t)-like early rise AND deep T left at
-# day 19 for the H2 exchange to mobilize). NOT well-mixed (that killed the fast
-# early rise); NOT the old k=1e5 pure-diffusion sink (exchange then does nothing).
-flibe_D_0 *= 0.35
+# WELL-MIXED salt (molten salt convects): large D so L^2/D << release time and the
+# release is SURFACE-limited, controlled by LIQUID_KD alone -- matching the LIBRA
+# k_top picture. Then k_d ~ LIBRA k_top (~8.9e-8) reproduces the He runs and the
+# H2 enhancement (k_ex*c_H) is a clean, consistent surface effect across all runs.
+flibe_D_0 *= 10.0
 flibe_E_D = htm_D_flibe[0].act_energy.magnitude
-flibe_S_0 = htm_S_flibe[0].pre_exp.magnitude * 1e15
+# Salt-side solubility scaling (FITTED; salt side is the legitimate fitting
+# ground). Goes with the Henry interface jump and penalty=1e34.
+# (Sievert-CLLiF test 2026-06-10, CLOSED: with a fair x320 rescale the linear
+# interface ratio dumps the post-switch inventory through the wall in ~3 d --
+# OV 9.2 vs exp 4.2 -- because the constant ratio lacks Henry's 1/sqrt(c_l)
+# throttling that produces the observed 27-d gradual OV rise. Henry kept.)
+FLIBE_S_SCALE = 1e15
+flibe_S_0 = htm_S_flibe[0].pre_exp.magnitude * FLIBE_S_SCALE
 flibe_E_S = htm_S_flibe[0].act_energy.magnitude
 
 htm_D_inconel = htm.diffusivities.filter(material="inconel_625")
@@ -450,7 +538,9 @@ K_inconel = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K))
 
 # penalty = 1e32  # this is used for the run 1 & 2 with the factor of 1e12 in the salt solubility.
 # penalty = 1e35  # this is used for the run 4 with the factor of 1e12 in the salt solubility.
-penalty = 1e34
+penalty = 1e34  # goes with Henry CLLiF + FLIBE_S_SCALE = 1e15
+# (sievert + FLIBE_S_SCALE=320 needed penalty ~1e22 -- interface c/K magnitudes
+# scale the penalty term; retune ONLY if a parameter change breaks convergence)
 # penalty = 1e10
 atol = 1e-6
 rtol = 1e-6
@@ -517,14 +607,60 @@ def compute_h2_conc(h2_conc_ppm=1000):
 # ---------------------------------------------------------------------------
 
 # Fitted liquid free-surface coefficients.
-LIQUID_KD = 8e-8  # desorption coeff [m/s] -- FITTED (He channel, runs 1&2 magnitude).
-LIQUID_KEX = 4e-30  # isotopic-exchange coeff [m^4/s/atom] -- FITTED (H2 switch strength).
+# Phase-resolved fits of the experimental IV curves (well-mixed single pool):
+#   run 1 (He cover): k_eff 8.8e-8 = LIBRA k_top 8.9e-8 -> LIQUID_KD
+#   runs 3 & 4 pre-19 (sparge): k_eff 1.22e-7 BOTH -> sparge adds ~3.4e-8,
+#     and 1000 ppm H2 (run 4) does NOT increase the stripping rate vs He (run 3)
+#     -> the H2 surface-exchange enhancement is ~0 (LIQUID_KEX = 0); H2's effect
+#     is carried by the bound-pool (TF) conversion instead, see below.
+# TEST (slow-accumulation regime): SMALL linear k + LARGE D (x10, well-mixed):
+# the whole melt holds a high uniform concentration and bleeds out slowly,
+# tau = V/(k*A) ~ 25 d -> ~47% still retained at day 19. The day-19 response
+# comes from the H2 surface-exchange term k_ex*c_H (boost ~5x at 1000 ppm).
+LIQUID_KD = 3e-8  # desorption coeff [m/s] (slow; tau ~ 25 d)
+LIQUID_KEX = 1.5e-30  # H2 surface-exchange coeff [m^4/s/atom]
+
+# (c2 surface-control test, CLOSED by run 2: t_c ~ 1/c0 makes the high-production
+# run release ~6x too fast; data demands first-order kinetics.)
+# LIQUID_KR = 2e-20  # [m^4/s/atom]
+
+# --- Sparge extraction (runs 3/4: gas bubbled through the melt) ---
+# Volumetric stripping sink S = -lambda*c, exits with the sparge gas to the IV
+# bubbler. In the well-mixed melt this is mathematically equivalent to adding
+# lambda*V/A to the liquid-surface coefficient, which is how it is implemented:
+#   k_liq(run) = LIQUID_KD + K_SPARGE[run]
+# K_SPARGE = empirical 1.22e-7 - 8.8e-8 from the phase-resolved fits.
+K_SPARGE = {1: 0.0, 2: 0.0, 3: 3.4e-8, 4: 3.4e-8}
+
+# --- Bound-tritium (TF) pool: salt speciation chemistry ---
+# A fraction F_BOUND of the tritium is born as chemically bound TF (energetic T+
+# thermalizing in a fluoride melt), which is NON-volatile: He sparging cannot
+# strip it. H2 converts it (H2 + TF -> HF + HT) at a rate linear in p_H2, which
+# unlocks it into the mobile (strippable) pool -> the day-19 features.
+# F_BOUND is a PER-RUN INITIAL CONDITION (salt redox state): runs 1/2 used
+# fresher salt (~full release under He -> ~0), runs 3/4 reuse the salt with
+# accumulated radiolysis/oxidation products -> large bound fraction.
+# F_BOUND = {1: 0.0, 2: 0.0, 3: 0.44, 4: 0.44}  # speciation model (paused)
+F_BOUND = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}  # TEST: c2-surface-control, bound pool OFF
+# Conversion rate at 1000 ppm H2 [1/s]; scales linearly with ppm (Henry).
+# Initial estimate: run 4 pre-19 (1000 ppm) released ~52% of its bound pool in
+# 19 d -> tau ~ 26 d -> kappa ~ 4.5e-7.
+KAPPA_CONV_1000 = 4.5e-7
+
+# Inconel H2 isotopic-exchange channel (T+H -> HT): FITTED multiplier on the htm
+# Kr, applied ONLY to the c_H*c exchange term. The He-phase recombination Kr*c^2
+# keeps the unmodified htm value (no fitting) -- experiment shows OV ~ 0 during
+# He, so the c^2 channel must stay at its (tiny) literature value; the day-19+
+# OV rise is carried entirely by the exchange channel.
+INCONEL_KEX_MULT = 2.5
 
 # Physical (un-fudged) CLLiF Henry solubility for the H-partner concentration.
 # flibe_S_0 carries a x1e15 numerical-penalty scaling (see Material props); that
 # scaling is for the interface jump, not a physical solubility, so divide it out
 # here to get a meaningful dissolved-H concentration.
-K_flibe_phys = (flibe_S_0 / 1e15) * np.exp(-flibe_E_S / (8.617e-5 * temperature_K))
+K_flibe_phys = (flibe_S_0 / FLIBE_S_SCALE) * np.exp(
+    -flibe_E_S / (8.617e-5 * temperature_K)
+)
 
 
 def compute_h2_conc_henry(h2_conc_ppm=1000):
@@ -554,6 +690,9 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
     measurement_time = get_total_measurement_time(run_id)
 
+    # Exact H2 switch time for this run (falls back to the legacy 19 d).
+    t_switch_h2 = T_SWITCH_H2_BY_RUN.get(run_id, T_SWITCH_H2)
+
     # --- Time-dependent source over the real irradiation segments ---
     tritium_source, source_strength, irr_segments = make_tritium_source(run_id)
 
@@ -567,10 +706,10 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
     milestones = sorted(set(source_milestones))
     if sweep_gas in ("He_then_H2", "H2"):
-        milestones.append(T_SWITCH_H2)
+        milestones.append(t_switch_h2)
         milestones = sorted(set(milestones))
 
-    model = F.HydrogenTransportProblemDiscontinuous()
+    model = TimeAwareProblem()
 
     # --- Mesh ---
     _read = gmshio.read_from_msh("baby_2d.msh", MPI.COMM_WORLD, 0, gdim=2)
@@ -652,12 +791,54 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
     # --- Species ---
     T = F.Species("T", mobile=True, subdomains=[vol_cllif, vol_inconel])
-    model.species = [T]
 
-    # --- Source ---
+    # --- Bound (TF) pool: per-run fraction of production is born bound; H2
+    # converts it to mobile T at kappa(t) ~ p_H2(t) (see F_BOUND/KAPPA_CONV_1000).
+    f_bound = F_BOUND.get(run_id, 0.0)
+    T_bound = None
+    if f_bound > 0:
+        T_bound = F.Species("T_bound", mobile=False, subdomains=[vol_cllif])
+        model.species = [T, T_bound]
+
+        # H2 schedule -> conversion rate schedule (linear in ppm).
+        if sweep_gas == "He_then_H2":
+            kappa_early, kappa_late = 0.0, KAPPA_CONV_1000
+        elif sweep_gas == "H2":  # run 4: 1000 ppm then 3.5%
+            kappa_early, kappa_late = KAPPA_CONV_1000, KAPPA_CONV_1000 * 35
+        else:  # pure He: bound pool never converts
+            kappa_early, kappa_late = 0.0, 0.0
+
+        model.reactions = [
+            H2ConversionReaction(
+                reactant=[T_bound],
+                product=[T],
+                k_0=0.0,
+                E_k=0.0,
+                volume=vol_cllif,
+                kappa_early=kappa_early,
+                kappa_late=kappa_late,
+                t_switch=t_switch_h2,
+            )
+        ]
+    else:
+        model.species = [T]
+        model.reactions = []
+
+    # --- Source (split mobile / bound by f_bound) ---
+    def source_mobile(t):
+        return (1.0 - f_bound) * tritium_source(t)
+
     model.sources = [
-        F.ParticleSource(value=tritium_source, volume=vol_cllif, species=T),
+        F.ParticleSource(value=source_mobile, volume=vol_cllif, species=T),
     ]
+    if T_bound is not None:
+
+        def source_bound(t):
+            return f_bound * tritium_source(t)
+
+        model.sources.append(
+            F.ParticleSource(value=source_bound, volume=vol_cllif, species=T_bound)
+        )
 
     # -----------------------------------------------------------------------
     # Recombination boundary conditions on the Inconel-gas surfaces.
@@ -678,8 +859,8 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
         def recombination_flux(c, T, t):
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
-            h2 = ufl.conditional(ufl.ge(t, T_SWITCH_H2), h2_late, h2_early)
-            return -Kr * c**2 - Kr * h2 * c
+            h2 = ufl.conditional(ufl.gt(t, t_switch_h2), h2_late, h2_early)
+            return -Kr * c**2 - INCONEL_KEX_MULT * Kr * h2 * c
 
     elif sweep_gas == "He":
         h2_late = 0.0
@@ -695,8 +876,8 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
             # UFL symbolic conditional: H2 turns on at T_SWITCH_H2.
             # `t` here is the symbolic simulation time supplied by FESTIM.
-            h2 = ufl.conditional(ufl.ge(t, T_SWITCH_H2), h2_late, 0.0)
-            return -Kr * c**2 - Kr * h2 * c
+            h2 = ufl.conditional(ufl.gt(t, t_switch_h2), h2_late, 0.0)
+            return -Kr * c**2 - INCONEL_KEX_MULT * Kr * h2 * c
 
     else:
         raise ValueError(
@@ -706,28 +887,28 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     if sweep_gas == "He_then_H2":
 
         def h2_conc_export(t):
-            return h2_late if t >= T_SWITCH_H2 else 0.0
+            return h2_late if t > t_switch_h2 else 0.0
 
     elif sweep_gas == "H2":
 
         def h2_conc_export(t):
-            return h2_late if t >= T_SWITCH_H2 else h2_early
+            return h2_late if t > t_switch_h2 else h2_early
 
     else:
         h2_conc_export = h2_late
 
     # -----------------------------------------------------------------------
-    # Liquid (CLLiF) free-surface release: LINEAR desorption + isotopic exchange.
-    #   J = (k_d + k_ex * c_H) * c
-    # Linear in c (Henry/molecular T2 desorption; exchange T2+H2->2HT also needs
-    # only one T). c_H = K_H * p_H2 (Henry, linear in p).
+    # Liquid (CLLiF) free-surface release (slow-accumulation TEST):
+    #   J = (LIQUID_KD + LIQUID_KEX * c_H(t)) * c
+    # Small k_d + well-mixed melt -> the liquid holds a high uniform inventory
+    # and bleeds slowly; the H2 exchange term raises k_eff at the switch.
     # -----------------------------------------------------------------------
     if sweep_gas == "H2":
         h2_early_liq = compute_h2_conc_henry(1000)
         h2_late_liq = compute_h2_conc_henry(35000)
 
         def liquid_surface_flux(c, T, t):
-            c_H = ufl.conditional(ufl.ge(t, T_SWITCH_H2), h2_late_liq, h2_early_liq)
+            c_H = ufl.conditional(ufl.gt(t, t_switch_h2), h2_late_liq, h2_early_liq)
             return -(LIQUID_KD + LIQUID_KEX * c_H) * c
 
     elif sweep_gas == "He":
@@ -740,24 +921,32 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         h2_late_liq = compute_h2_conc_henry(1000)
 
         def liquid_surface_flux(c, T, t):
-            c_H = ufl.conditional(ufl.ge(t, T_SWITCH_H2), h2_late_liq, 0.0)
+            c_H = ufl.conditional(ufl.gt(t, t_switch_h2), h2_late_liq, 0.0)
             return -(LIQUID_KD + LIQUID_KEX * c_H) * c
 
-    # k_eff(t) = k_d + k_ex*c_H(t) [m/s] for the export, J = k_eff(t)*c.
+    # k_eff(t) for the export, J = k_eff(t)*c.
     if sweep_gas == "He_then_H2":
 
         def liquid_keff_export(t):
-            c_H = h2_late_liq if t >= T_SWITCH_H2 else 0.0
+            c_H = h2_late_liq if t > t_switch_h2 else 0.0
             return LIQUID_KD + LIQUID_KEX * c_H
 
     elif sweep_gas == "H2":
 
         def liquid_keff_export(t):
-            c_H = h2_late_liq if t >= T_SWITCH_H2 else h2_early_liq
+            c_H = h2_late_liq if t > t_switch_h2 else h2_early_liq
             return LIQUID_KD + LIQUID_KEX * c_H
 
     else:
         liquid_keff_export = LIQUID_KD
+
+    # Paused speciation-model law (constant k, sparge in K_SPARGE):
+    # k_liq = LIQUID_KD + K_SPARGE.get(run_id, 0.0)
+    #
+    # def liquid_surface_flux(c, T):
+    #     return -k_liq * c
+    #
+    # liquid_keff_export = k_liq
 
     subfolder = f"{results_folder}/run_{run_id}/sweep_{sweep_gas}"
 
@@ -851,6 +1040,13 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     # -----------------------------------------------------------------------
 
     # Helper to build a recomb-eq flux export for a given Inconel surface.
+    # kex_0 mirrors the BC: exchange channel = INCONEL_KEX_MULT * Kr (isothermal).
+    inconel_kex_eff = (
+        INCONEL_KEX_MULT
+        * inconel_Kr_0
+        * np.exp(-inconel_E_Kr / (8.617e-5 * temperature_K))
+    )
+
     def make_recomb_eq_export(surface, name, filename, h2_conc):
         return CylindricalSurfaceFluxFromEquation(
             field=T,
@@ -861,6 +1057,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             inconel_E_Kr=inconel_E_Kr,
             temperature=temperature_K,
             h2_conc=h2_conc,
+            kex_0=inconel_kex_eff,
             name=name,
         )
 
@@ -969,8 +1166,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         #     filename=f"{subfolder}/flux_gap_sidewall.csv",
         #     name="Inconel gap sidewall",
         # ),
-        # ---- Liquid free surface release (linear desorption + exchange, IV-bound) ----
-        # J = (k_d + k_ex*c_H)*c = k_eff(t)*c.
+        # ---- Liquid free surface release (linear, J = k_eff(t)*c) ----
         CylindricalSurfaceFluxMassTransfer(
             field=T,
             surface=liquid_surface,
@@ -1030,6 +1226,16 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         ),
     ]
 
+    # Bound (TF) pool inventory, for mass balance.
+    if T_bound is not None:
+        model.exports.append(
+            CylindricalTotalVolume(
+                field=T_bound,
+                volume=vol_cllif,
+                filename=f"{subfolder}/inventory_bound.csv",
+            )
+        )
+
     # return model
     return model, T, vol_cllif, vol_inconel
 
@@ -1052,7 +1258,7 @@ if __name__ == "__main__":
     }
 
     # for run_id in [1, 2, 3, 4]:
-    for run_id in [1, 3]:  # mixed-control test: run 1 (He early phase) + run 3 (switch)
+    for run_id in [3]:  # restore Henry run-3 results after the sievert test
         sweep = RUN_SWEEP[run_id]
         print(f"\n=== Run {run_id} / {sweep} sweep ===")
         # set_log_level(LogLevel.INFO)
