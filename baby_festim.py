@@ -1,3 +1,22 @@
+"""BABY-1L tritium transport: FESTIM 2D axisymmetric hot-zone baseline.
+
+Current model (2026-07-14). This file solves the hot-zone physics only:
+  salt: well-mixed (Calderoni D x10), Henry solubility (x FLIBE_S_SCALE);
+        production = nominal neutronics-anchored atoms/run;
+  IV:   liquid free surface J = k_d*c (literature k_top 8.9e-8) + H2 sparge
+        stripping (lambda) + inner-wall exchange (gap sidewall, top cap);
+  OV:   Henry|Sievert interface -> diffusion through Inconel (literature) ->
+        surface release J = 2*Kr*c^2 + Kr*c_H*c (Perujo oxidised, atoms flux).
+Delayed collection on the cold hardware (deposition on tubing and the OV
+enclosure, later released by H2) and the per-run production calibration are
+applied in a separate 0-D post-processing layer (deposition fraction f,
+OV split beta, first-order H2 scavenging per collection path; the fitting
+and post-processing scripts will be released together with the paper).
+Retired mechanisms (in-salt bound pool, locked floors, Langmuir c_sat,
+external injections) default to 0 but remain reachable via BABY_* envs;
+their history is kept in the comment blocks below.
+"""
+
 import numpy as np
 import festim as F
 import h_transport_materials as htm
@@ -95,8 +114,11 @@ class CylindricalSurfaceFlux(F.SurfaceFlux):
 # This is the PHYSICAL release rate (always >= 0) and is the right quantity
 # to integrate for cumulative tritium release.
 #
-# He case:  J = Kr * c^2
-# H2 case:  J = Kr * c^2 + Kr * c_H2(t) * c
+# He case:  J = 2 * Kr * c^2
+# H2 case:  J = 2 * Kr * c^2 + Kr * c_H2(t) * c
+# (factor 2 on the homonuclear term: each T2 removes TWO T atoms; the
+# heteronuclear HT term removes ONE T per molecule, so coefficient 1 --
+# FESTIM 2.x SurfaceReactionBC convention, atoms flux = 2*K when A=B.)
 #
 # The export reads the current simulation time from the model time constant
 # bound after model.initialise(). This allows c_H2 to be a time-dependent
@@ -109,10 +131,10 @@ class CylindricalSurfaceFluxFromEquation(F.SurfaceFlux):
     Cylindrical surface flux computed from the recombination equation.
 
     For sweep_gas == "He":
-        J = integral(Kr * c^2 * r  dS) * 2*pi
+        J = integral(2 * Kr * c^2 * r  dS) * 2*pi
 
     For sweep_gas == "H2":
-        J = integral( (Kr * c^2 + Kr * c_H2(t) * c) * r  dS) * 2*pi
+        J = integral( (2 * Kr * c^2 + Kr * c_H2(t) * c) * r  dS) * 2*pi
     """
 
     azimuth_range: tuple = (0.0, 2 * np.pi)
@@ -186,7 +208,7 @@ class CylindricalSurfaceFluxFromEquation(F.SurfaceFlux):
 
         # Physical release: T+T -> T2 (recomb)  plus  T+H -> HT (exchange, if H2)
         # Both terms are non-negative since c >= 0 and h2_conc >= 0
-        integrand = Kr * u**2 + kex * h2_conc * u
+        integrand = 2 * Kr * u**2 + kex * h2_conc * u
 
         flux = assemble_scalar(
             fem.form(
@@ -533,14 +555,21 @@ def make_tritium_source(run_id):
 #   run3's day18-28 2nd plateau sits flat ~19 (H2 strips BABY residual) while data
 #   rises to ~24 -- a ~5 Bq gap (IVrmse 2.16). Filling it would need F back or a
 #   2nd injection @day18. run1/2 (He cover): pure BABY, no external.
-# 2026-06-22 LOCKED-FLOOR MODEL (current): production [atoms] per run. run2 is
+# 2026-06-22 LOCKED-FLOOR MODEL: production [atoms] per run. run2 is
 # LOWERED below its fluence value -- the run2 data is contaminated/inflated
 # (heater-freeze episode), so its true breeding is less. All other physical
 # params (F, c_sat, kappa, lambda, k_d) are UNIFIED across runs; only production
 # differs (each run a different fluence). The 2nd/3rd plateaus are made by the
 # bound pool (F_BOUND) being freed by H2 down to a LOCKED FLOOR (KAPPA_FLOOR_*),
 # not by an external source -- so EXT_INJ_* is OFF.
-TRITIUM_PROD_INTRINSIC = {1: 1.31e10, 2: 6.4e10, 3: 1.44e10, 4: 2.25e10}
+# 2026-07-14 (current line-holdup model): the values below are the nominal
+# neutronics-anchored productions used by the hot-zone baseline.
+# run4 = 2.75e10 (line-base recalibration of the suspect run4 rate).
+# The per-run production CALIBRATION (run1 x0.8259, run2-4 x0.8786 -- the
+# exact no-permanent-trap reparameterization) is applied in the
+# post-processing layer, not here: the salt physics is linear, so scaling
+# there is exact and the baseline CSVs stay reusable across calibrations.
+TRITIUM_PROD_INTRINSIC = {1: 1.31e10, 2: 6.4e10, 3: 1.44e10, 4: 2.75e10}
 TRITIUM_PROD_EXTERNAL = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}  # external retired (floor model)
 TRITIUM_PRODUCTION = {
     r: _env_float(f"BABY_PROD_{r}", TRITIUM_PROD_INTRINSIC[r] + TRITIUM_PROD_EXTERNAL[r])
@@ -567,8 +596,10 @@ V_CLLIF = 1.0e-3
 #   Floor model (2026-06-22): run1/2 (He) trap F_BOUND and accumulate -- nothing
 #   is released under He, so run2's trapped pool carries to run3 (history). run3
 #   seeds run1+run2's accumulated trap (~41 Bq), run4 seeds run3's leftover (~41).
+# 2026-07-14 (line-holdup model): carry-over set to 0 -- cross-run history is
+# carried by the cold-hardware pools of the post-processing layer.
 BOUND_INIT_BQ = {r: _env_float(f"BABY_BOUND_INIT_{r}", _d)
-                 for r, _d in {1: 0.0, 2: 0.0, 3: 41.0, 4: 41.0}.items()}
+                 for r, _d in {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}.items()}
 _LAMBDA_T_BQ = 3.57e14 * 3.016 / 6.02214076e23  # Bq per tritium atom
 
 # "Locked floor" of the trapped pool [Bq]: H2 frees T_bound only DOWN TO this
@@ -583,13 +614,14 @@ _LAMBDA_T_BQ = 3.57e14 * 3.016 / 6.02214076e23  # Bq per tritium atom
 # early floor = late floor (= single constant floor).
 # Floor model (2026-06-22): run3 0.1% floor 41 (= run4 0.1% floor, UNIFIED gas);
 # run4 3.5% floor 35 (deeper -- more H2 frees more). run1/2 (He) never release.
+# 2026-07-14 (line-holdup model): floors set to 0 (the floor mechanism is
+# retired along with the bound pool; inert while F_BOUND = 0).
 KAPPA_FLOOR_BQ = {r: _env_float(f"BABY_KAPPA_FLOOR_{r}", _d)
-                  for r, _d in {1: 0.0, 2: 0.0, 3: 41.0, 4: 35.0}.items()}
-# Early (pre-switch) floor; run4's 0.1% phase locks at 41 (= run3), its 3.5%
-# phase frees deeper to 35 (KAPPA_FLOOR_BQ above). Others = their late floor.
+                  for r, _d in {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}.items()}
+# Early (pre-switch) floor; only meaningful with F_BOUND > 0.
 KAPPA_FLOOR_EARLY_BQ = {
     r: _env_float(f"BABY_KAPPA_FLOOR_EARLY_{r}", _d)
-    for r, _d in {1: 0.0, 2: 0.0, 3: 41.0, 4: 41.0}.items()
+    for r, _d in {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}.items()
 }
 
 # ---------------------------------------------------------------------------
@@ -732,9 +764,14 @@ def compute_h2_conc(h2_conc_ppm=1000):
 #   1.1e-7 (run1 0.67->0.50, run3 IV 0.98->0.81 & OV 0.31->0.24, run4 ~same).
 #   Cost: run2 fits worse, accepted (contaminated). Departs ~24% from LIBRA
 #   k_top 8.9e-8 but is what the clean run1 free-surface data wants.
+# 2026-07-14 (line-holdup model): back to the literature value 8.9e-8 (k_top).
+#   The 1.1e-7 was fitted when the salt-side bound pool carried the H2 response;
+#   with the line-holdup layer the release shaping happens in the cold hardware
+#   and the free surface keeps its literature coefficient (Inconel-style rule:
+#   fit in the post-processing layer, not on physical surfaces).
 # H2 surface exchange on the liquid is OFF (the H2 response is carried by the
-# bound-pool conversion + sparge sink, not by surface kinetics).
-LIQUID_KD = _env_float("BABY_KD", 1.1e-7)  # desorption coeff [m/s]
+# sparge sink + line-holdup scavenging, not by surface kinetics).
+LIQUID_KD = _env_float("BABY_KD", 8.9e-8)  # desorption coeff [m/s]
 LIQUID_KEX = _env_float("BABY_KEX", 0.0)  # H2 surface-exchange coeff [m^4/s/atom]
 # Langmuir-type saturation of the free-surface desorption [1/m^3]; 0 = off:
 #   J = k_eff * c / (1 + c/LIQUID_CSAT)
@@ -746,7 +783,10 @@ LIQUID_KEX = _env_float("BABY_KEX", 0.0)  # H2 surface-exchange coeff [m^4/s/ato
 # the low-concentration runs but gives the natural curved (saturating) release
 # shape; without it (or with a much stronger c_sat) the high-inventory run2 goes
 # unphysically linear. This is the original calibrated Langmuir scale.
-LIQUID_CSAT = _env_float("BABY_CSAT", 2.3e13)
+# 2026-07-14 (line-holdup model): retired (0). Tested during model cleanup:
+# removing c_sat slightly improved the fit; run2's curvature is handled by the
+# contamination hypothesis + production calibration, not surface saturation.
+LIQUID_CSAT = _env_float("BABY_CSAT", 0.0)
 
 # (c2 surface-control test, CLOSED by run 2: t_c ~ 1/c0 makes the high-production
 # run release ~6x too fast; data demands first-order kinetics.)
@@ -824,11 +864,17 @@ def lambda_sparge(h2_ppm: float) -> float:
 # the sparger -- so run1/2 (He) trap it too and accumulate it (history), and H2
 # in run3/4 frees it down to a locked floor (KAPPA_FLOOR_*). This supersedes the
 # earlier "F=0 for He / external-source" picture above.
+# 2026-07-14 (current line-holdup model): F_BOUND = 0. The in-salt bound pool
+# is retired; the delayed-release physics is attributed to the cold hardware
+# (collection tubing / OV enclosure) and applied in the 0-D post-processing
+# layer described in the module docstring. The FESTIM solve
+# below is the hot-zone baseline. The earlier floor-model values remain
+# reachable via BABY_FBOUND_* / BABY_KAPPA_FLOOR_* / BABY_BOUND_INIT_* envs.
 F_BOUND = {
-    1: _env_float("BABY_FBOUND_1", 0.30),
-    2: _env_float("BABY_FBOUND_2", 0.30),
-    3: _env_float("BABY_FBOUND_3", 0.30),
-    4: _env_float("BABY_FBOUND_4", 0.30),
+    1: _env_float("BABY_FBOUND_1", 0.0),
+    2: _env_float("BABY_FBOUND_2", 0.0),
+    3: _env_float("BABY_FBOUND_3", 0.0),
+    4: _env_float("BABY_FBOUND_4", 0.0),
 }
 # Slow pool retired: with the unified fast-pool F=0.35 both sparged runs fit
 # without a separate slow population (run 4 used 0.43 here before 2026-06-15).
@@ -1205,14 +1251,14 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         def recombination_flux(c, T, t):
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
             h2 = ufl.conditional(ufl.gt(t, t_switch_h2), h2_late, h2_early)
-            return -Kr * c**2 - INCONEL_KEX_MULT * Kr * h2 * c
+            return -2 * Kr * c**2 - INCONEL_KEX_MULT * Kr * h2 * c
 
     elif sweep_gas == "He":
         h2_late = 0.0
 
         def recombination_flux(c, T):
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
-            return -Kr * c**2
+            return -2 * Kr * c**2
 
     elif sweep_gas == "He_then_H2":
         h2_late = compute_h2_conc(ppm_late)
@@ -1222,7 +1268,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             # UFL symbolic conditional: H2 turns on at T_SWITCH_H2.
             # `t` here is the symbolic simulation time supplied by FESTIM.
             h2 = ufl.conditional(ufl.gt(t, t_switch_h2), h2_late, 0.0)
-            return -Kr * c**2 - INCONEL_KEX_MULT * Kr * h2 * c
+            return -2 * Kr * c**2 - INCONEL_KEX_MULT * Kr * h2 * c
 
     else:
         raise ValueError(
