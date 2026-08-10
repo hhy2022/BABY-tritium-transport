@@ -422,6 +422,14 @@ RUN_URLS = {
     2: "https://raw.githubusercontent.com/LIBRA-project/BABY-1L-run-2/refs/tags/v0.5/data/processed_data.json",
     3: "https://raw.githubusercontent.com/LIBRA-project/BABY-1L-run-3/refs/tags/v0.2/data/processed_data.json",
     4: "https://raw.githubusercontent.com/LIBRA-project/BABY-1L-run-4/refs/tags/v0.1/data/processed_data.json",
+    # runs 6/12 (added 2026-07-28): no git tags exist on these repos yet, so
+    # pin to the main-branch commit SHA at discovery time for reproducibility
+    # (verified via `git ls-remote`). Re-pin if the upstream repo publishes a
+    # tag. Run 5's repo does not exist on GitHub (skipped/never published);
+    # runs 7/8/9/10/11 exist but have no processed_data.json committed yet
+    # (raw LSC CSVs only) -- not wired in here.
+    6: "https://raw.githubusercontent.com/LIBRA-project/BABY-1L-run-6/82c5af999e43d4855f1e1400c2c455c4fb10fe5e/data/processed_data.json",
+    12: "https://raw.githubusercontent.com/LIBRA-project/BABY-1L-run-12/31cbfc480c4901c8be3f24f85f8cc24596057c60/data/processed_data.json",
 }
 
 # Local cache of each run's processed_data.json (fitting/cache/run_<id>.json):
@@ -456,9 +464,45 @@ def _get_run_data(run_id: int) -> dict:
 # gas_switch_time minus the first irradiation (generator) start.
 #   run 3: 4/4/2025 15:06 - 3/17/2025 10:03 = day 18.210
 #   run 4: 5/18/2025 19:58 - 5/1/2025 11:07 = day 17.369
+#   run 6: 6/2/2025 16:50 - 5/30/2025 11:28 = day 3.224 (H2 -> He, opposite
+#          direction: see sweep_gas "H2_then_He")
+#   run 8: gas_switch_time - first nGen-400 period start = day 3.0146
+#          (He -> 3.5% H2, same direction as run 3 but earlier/higher target)
 # The old hardcoded value (19 d) was ~0.8-1.6 d late.
-T_SWITCH_H2_BY_RUN = {3: 18.210 * 86400, 4: 17.369 * 86400}
+T_SWITCH_H2_BY_RUN = {3: 18.210 * 86400, 4: 17.369 * 86400, 6: 3.224 * 86400, 8: 260460.0}
 T_SWITCH_H2 = 19 * 86400  # legacy default for runs not listed above
+
+# Constant H2 fraction [ppm] for sweep_gas "H2_const" runs (no gas switch).
+#   run 12: "3.65% H2 in He" throughout (general.json cover_gas.type).
+RUN_H2_CONST_PPM = {12: 36500}
+
+# Pre-switch H2 fraction [ppm] for sweep_gas "H2_then_He" runs (H2 present
+# from t=0, switched OFF to pure He at T_SWITCH_H2_BY_RUN).
+#   run 6: "3.5% H2 bal. He" pre-switch (general.json cover_gas.type).
+RUN_H2_THEN_HE_PPM = {6: 35000}
+
+# Per-run salt temperature [degC] (added 2026-08-10). Every run's
+# general.json documents its own temperature_salt (always flagged "minimum,
+# non-uniform" -- the real bulk/interface temperature is somewhat higher
+# everywhere, so these are still a lower bound, not a fitted value). Runs not
+# listed here fall back to the module-level default TEMPERATURE_C_DEFAULT
+# (650) -- i.e. runs 1-4's behavior is UNCHANGED by this dict's existence.
+#   run 6:  634 degC (general.json temperature_salt, same as runs 3/4/7-11)
+#   run 12: 685 degC (general.json temperature_salt -- notably hotter; the
+#           run 12 IV/OV misfit investigation flagged this as a real,
+#           untested lever: Kr's ~1.0 eV activation energy makes it the most
+#           temperature-sensitive material parameter, ~59% higher at 958K
+#           (run 12's own temp) than the model's fixed 923K default).
+# Runs 7/8 deliberately NOT added here -- they stay on the unchanged default
+# so they remain a clean held-out check of whether this change helps 6/12
+# without being tuned themselves.
+TEMPERATURE_C_DEFAULT = 650
+RUN_TEMPERATURE_C = {6: 634, 12: 685}
+
+# Post-switch H2 fraction [ppm] for sweep_gas "He_then_H2" runs (pure He
+# until T_SWITCH_H2_BY_RUN, then H2 turns on). run 3's original 1000 ppm is
+# the default; run 8 switches to 3.5% instead.
+RUN_HE_THEN_H2_PPM = {8: 35000}
 
 
 def get_total_measurement_time(run_id: int) -> float:
@@ -569,11 +613,35 @@ def make_tritium_source(run_id):
 # exact no-permanent-trap reparameterization) is applied in the
 # post-processing layer, not here: the salt physics is linear, so scaling
 # there is exact and the baseline CSVs stay reusable across calibrations.
-TRITIUM_PROD_INTRINSIC = {1: 1.31e10, 2: 6.4e10, 3: 1.44e10, 4: 2.75e10}
-TRITIUM_PROD_EXTERNAL = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}  # external retired (floor model)
+# runs 6/12 (added 2026-07-28): UNCALIBRATED. Value = raw neutronics anchor
+# (TBR_used_in_model * neutron_rate_used_in_model * irradiation duration,
+# straight from each run's own processed_data.json) -- the same starting
+# point runs 1-4 had before the iterative fit against experimental release
+# data described in fitting/NOTES.md (c.f. DOSE_BEFORE[1]=9.45e9, which is
+# exactly this raw formula for run 1, vs the recalibrated 1.31e10 below).
+# These two have NOT been through that calibration; treat as a placeholder
+# until run 6/12 are fit with fitting/line_floor.py.
+#   run 6:  0.0022510435099635084 * 1286768790.390309 * 3600      = 1.043e10
+#   run 12: 0.002280103802516543  * 1820000000.0       * 10800    = 4.482e10
+# runs 7/8 (added 2026-08-10): EVEN MORE UNCALIBRATED than 6/12. Their repos
+# have no processed_data.json at all (see fitting/cache/run_7.json / run_8.json
+# -- LSC-only local extraction, no OpenMC statepoint -> no TBR/neutron_rate
+# fields). No independent TBR anchor exists, so this is not the run6/12
+# formula -- it's a bare FLOOR: total measured release (IV_final + OV_final,
+# converted particles->atoms) by the last sample. True production is at
+# least this much (whatever hasn't escaped yet by the last sample is not
+# counted), so this under-estimates, likely more so than run 6/12's anchor.
+#   run 7: IV 16.195 Bq + OV 0.347 Bq (day 6.03) -> 9.252e9 atoms
+#   run 8: IV 21.216 Bq + OV 13.460 Bq (day 6.96) -> 1.939e10 atoms
+TRITIUM_PROD_INTRINSIC = {
+    1: 1.31e10, 2: 6.4e10, 3: 1.44e10, 4: 2.75e10,
+    6: 1.043e10, 12: 4.482e10,
+    7: 9.252e9, 8: 1.939e10,
+}
+TRITIUM_PROD_EXTERNAL = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 6: 0.0, 12: 0.0, 7: 0.0, 8: 0.0}  # external retired (floor model)
 TRITIUM_PRODUCTION = {
     r: _env_float(f"BABY_PROD_{r}", TRITIUM_PROD_INTRINSIC[r] + TRITIUM_PROD_EXTERNAL[r])
-    for r in (1, 2, 3, 4)
+    for r in (1, 2, 3, 4, 6, 7, 8, 12)
 }
 
 # LATE external-source injection [atoms] = source (2) above, born MOBILE over the
@@ -670,7 +738,7 @@ inconel_E_Kr = htm_recomb_inconel[1].act_energy.magnitude
 # Penalty term + solver tolerances
 # -------------------------------------------------------------------
 
-temperature_K = 650 + 273.15
+temperature_K = TEMPERATURE_C_DEFAULT + 273.15  # module-level default (runs w/o a RUN_TEMPERATURE_C entry)
 # h = 0.001
 
 D_flibe = flibe_D_0 * np.exp(-flibe_E_D / (8.617e-5 * temperature_K))
@@ -705,7 +773,7 @@ def compute_p_h2(h2_conc_ppm=1000):
     return P_h2
 
 
-def compute_h2_conc(h2_conc_ppm=1000):
+def compute_h2_conc(h2_conc_ppm=1000, K_inconel_val=None):
     """Dissolved atomic H concentration at the Inconel surface [m^-3].
 
     The isotopic-exchange recombination term is Kr * c_H * c, where Kr is the
@@ -719,9 +787,15 @@ def compute_h2_conc(h2_conc_ppm=1000):
     NOT the gas-phase H2 molecular number density. Crucially this makes the
     exchange term scale as sqrt(p_H2) (so 1000 ppm -> 3.5% is x sqrt(35) ~ 5.9),
     not linearly in p_H2.
+
+    K_inconel_val: override for the run's own temperature (build_model passes
+    its per-run value); defaults to the module-level (TEMPERATURE_C_DEFAULT)
+    K_inconel for any caller outside a run context.
     """
+    if K_inconel_val is None:
+        K_inconel_val = K_inconel
     P_h2 = compute_p_h2(h2_conc_ppm)
-    return K_inconel * np.sqrt(P_h2)
+    return K_inconel_val * np.sqrt(P_h2)
 
 
 # Legacy (physically inconsistent) version: gas-phase H2 molecular number
@@ -958,12 +1032,17 @@ K_flibe_phys = (flibe_S_0 / FLIBE_S_SCALE) * np.exp(
 )
 
 
-def compute_h2_conc_henry(h2_conc_ppm=1000):
+def compute_h2_conc_henry(h2_conc_ppm=1000, K_flibe_phys_val=None):
     """Dissolved H concentration in CLLiF [m^-3] via Henry's law:
         c_H = K_H * p_H2        (LINEAR in p_H2)
     Used as the isotopic-exchange partner for the liquid free-surface release.
+
+    K_flibe_phys_val: per-run override (see compute_h2_conc's K_inconel_val);
+    defaults to the module-level (TEMPERATURE_C_DEFAULT) value.
     """
-    return K_flibe_phys * compute_p_h2(h2_conc_ppm)
+    if K_flibe_phys_val is None:
+        K_flibe_phys_val = K_flibe_phys
+    return K_flibe_phys_val * compute_p_h2(h2_conc_ppm)
 
 
 # ---------------------------------------------------------------------------
@@ -975,12 +1054,17 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     """
     Build the 2D axisymmetric FESTIM model.
 
-    sweep_gas : "He", "H2", or "He_then_H2"
+    sweep_gas : "He", "H2", "H2_const", "He_then_H2", or "H2_then_He"
         "He"          : pure helium for the whole run (Kr*c^2 recombination).
-        "H2"          : constant H2 in the sweep gas (Kr*c^2 + Kr*c_H2*c).
+        "H2"          : run 4's schedule, 1000 ppm H2 -> 3.5% at T_SWITCH_H2.
+        "H2_const"    : constant H2 fraction for the whole run, no switch
+                        (ppm from RUN_H2_CONST_PPM[run_id]).
         "He_then_H2"  : pure He until T_SWITCH_H2, then H2 turns on
                         (handled with a UFL conditional in the BC, and with the
                          two-version "Method A" stitching in the exports).
+        "H2_then_He"  : H2 from t=0 (ppm from RUN_H2_THEN_HE_PPM[run_id]),
+                        switched OFF to pure He at T_SWITCH_H2 (opposite
+                        direction of "He_then_H2").
     """
 
     measurement_time = get_total_measurement_time(run_id)
@@ -994,6 +1078,20 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     # Exact H2 switch time for this run (falls back to the legacy 19 d).
     t_switch_h2 = T_SWITCH_H2_BY_RUN.get(run_id, T_SWITCH_H2)
 
+    # Per-run salt temperature (falls back to TEMPERATURE_C_DEFAULT -> exactly
+    # today's temperature_K for any run not in RUN_TEMPERATURE_C, so runs
+    # 1-4/7-11 are byte-for-byte unaffected by this). Only K_inconel/
+    # K_flibe_phys (H2-exchange partner concentrations) and Kr/model.temperature
+    # need a run-specific value here -- F.Material below takes D_0/E_D/K_S_0/
+    # E_K_S (pre-exp + activation energy) and FESTIM applies the Arrhenius law
+    # itself at model.temperature, so the salt/metal diffusivity and
+    # solubility are automatically correct once model.temperature is right.
+    temperature_K_run = RUN_TEMPERATURE_C.get(run_id, TEMPERATURE_C_DEFAULT) + 273.15
+    K_inconel_run = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * temperature_K_run))
+    K_flibe_phys_run = (flibe_S_0 / FLIBE_S_SCALE) * np.exp(
+        -flibe_E_S / (8.617e-5 * temperature_K_run)
+    )
+
     # --- Time-dependent source over the real irradiation segments ---
     tritium_source, source_strength, irr_segments = make_tritium_source(run_id)
 
@@ -1006,7 +1104,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         source_milestones.append(t_end)
 
     milestones = sorted(set(source_milestones))
-    if sweep_gas in ("He_then_H2", "H2"):
+    if sweep_gas in ("He_then_H2", "H2", "H2_then_He"):
         milestones.append(t_switch_h2)
         milestones = sorted(set(milestones))
     milestones = [m for m in milestones if m <= measurement_time]
@@ -1109,9 +1207,13 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
     # ppm schedule for this run's sweep gas (early phase, late phase).
     if sweep_gas == "He_then_H2":
-        ppm_early, ppm_late = 0, 1000
+        ppm_early, ppm_late = 0, RUN_HE_THEN_H2_PPM.get(run_id, 1000)
     elif sweep_gas == "H2":  # run 4: 1000 ppm then 3.5%
         ppm_early, ppm_late = 1000, 35000
+    elif sweep_gas == "H2_const":  # constant H2, no switch (e.g. run 12)
+        ppm_early = ppm_late = RUN_H2_CONST_PPM[run_id]
+    elif sweep_gas == "H2_then_He":  # H2 -> He, e.g. run 6
+        ppm_early, ppm_late = RUN_H2_THEN_HE_PPM[run_id], 0
     else:  # pure He
         ppm_early, ppm_late = 0, 0
 
@@ -1168,7 +1270,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     # T_sparged is an immobile tally species: its inventory is the cumulative
     # number of particles carried out with the sparge gas (IV-bound).
     T_sparged = None
-    if sweep_gas in ("He_then_H2", "H2"):  # runs with a sparger
+    if sweep_gas in ("He_then_H2", "H2", "H2_const", "H2_then_He"):  # runs with a sparger
         lam_early, lam_late = lambda_sparge(ppm_early), lambda_sparge(ppm_late)
     else:
         lam_early = lam_late = 0.0
@@ -1238,15 +1340,17 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     # It is reused below to build the post-switch export version (Method A).
     # -----------------------------------------------------------------------
 
-    if sweep_gas == "H2":
-        # Run 4 physical schedule: 1000 ppm H2 from t=0, switched to 3.5%
-        # (35000 ppm) at T_SWITCH_H2. compute_h2_conc(ppm) returns the
-        # DISSOLVED atomic-H concentration c_H = K_s,inconel*sqrt(p_H2), so the
-        # pressure step from 1000 ppm -> 3.5% scales c_H by sqrt(35) ~ 5.9.
-        # ppm_early/ppm_late are the single source of truth for the schedule
-        # (shared with the bound-pool conversion and the sparge sink).
-        h2_early = compute_h2_conc(ppm_early)
-        h2_late = compute_h2_conc(ppm_late)
+    if sweep_gas in ("H2", "H2_const", "H2_then_He"):
+        # Generic ppm_early -> ppm_late schedule stepping at t_switch_h2
+        # (ppm_early/ppm_late are the single source of truth, set above --
+        # shared with the bound-pool conversion and the sparge sink). Covers
+        # run 4's 1000ppm->3.5% ("H2"), a constant fraction with ppm_early ==
+        # ppm_late ("H2_const"), and an H2->He step-down ("H2_then_He").
+        # compute_h2_conc(ppm) returns the DISSOLVED atomic-H concentration
+        # c_H = K_s,inconel*sqrt(p_H2), so e.g. the 1000 ppm -> 3.5% step
+        # scales c_H by sqrt(35) ~ 5.9.
+        h2_early = compute_h2_conc(ppm_early, K_inconel_val=K_inconel_run)
+        h2_late = compute_h2_conc(ppm_late, K_inconel_val=K_inconel_run)
 
         def recombination_flux(c, T, t):
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
@@ -1261,7 +1365,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             return -2 * Kr * c**2
 
     elif sweep_gas == "He_then_H2":
-        h2_late = compute_h2_conc(ppm_late)
+        h2_late = compute_h2_conc(ppm_late, K_inconel_val=K_inconel_run)
 
         def recombination_flux(c, T, t):
             Kr = inconel_Kr_0 * ufl.exp(-inconel_E_Kr / (F.k_B * T))
@@ -1272,7 +1376,8 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
 
     else:
         raise ValueError(
-            f"Unknown sweep_gas '{sweep_gas}'. Use 'He', 'H2', or 'He_then_H2'."
+            f"Unknown sweep_gas '{sweep_gas}'. Use 'He', 'H2', 'H2_const', "
+            "'He_then_H2', or 'H2_then_He'."
         )
 
     if sweep_gas == "He_then_H2":
@@ -1280,7 +1385,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         def h2_conc_export(t):
             return h2_late if t > t_switch_h2 else 0.0
 
-    elif sweep_gas == "H2":
+    elif sweep_gas in ("H2", "H2_const", "H2_then_He"):
 
         def h2_conc_export(t):
             return h2_late if t > t_switch_h2 else h2_early
@@ -1300,9 +1405,9 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             return 1.0 + c / LIQUID_CSAT
         return 1.0
 
-    if sweep_gas == "H2":
-        h2_early_liq = compute_h2_conc_henry(ppm_early)
-        h2_late_liq = compute_h2_conc_henry(ppm_late)
+    if sweep_gas in ("H2", "H2_const", "H2_then_He"):
+        h2_early_liq = compute_h2_conc_henry(ppm_early, K_flibe_phys_val=K_flibe_phys_run)
+        h2_late_liq = compute_h2_conc_henry(ppm_late, K_flibe_phys_val=K_flibe_phys_run)
 
         def liquid_surface_flux(c, T, t):
             c_H = ufl.conditional(ufl.gt(t, t_switch_h2), h2_late_liq, h2_early_liq)
@@ -1315,7 +1420,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             return -LIQUID_KD * c / _sat(c)
 
     elif sweep_gas == "He_then_H2":
-        h2_late_liq = compute_h2_conc_henry(ppm_late)
+        h2_late_liq = compute_h2_conc_henry(ppm_late, K_flibe_phys_val=K_flibe_phys_run)
 
         def liquid_surface_flux(c, T, t):
             c_H = ufl.conditional(ufl.gt(t, t_switch_h2), h2_late_liq, 0.0)
@@ -1328,7 +1433,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             c_H = h2_late_liq if t > t_switch_h2 else 0.0
             return LIQUID_KD + LIQUID_KEX * c_H
 
-    elif sweep_gas == "H2":
+    elif sweep_gas in ("H2", "H2_const", "H2_then_He"):
 
         def liquid_keff_export(t):
             c_H = h2_late_liq if t > t_switch_h2 else h2_early_liq
@@ -1398,7 +1503,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
         *recomb_bcs,
     ]
 
-    model.temperature = temperature_K
+    model.temperature = temperature_K_run
 
     dt = F.Stepsize(
         initial_value=_env_float("BABY_DT_INIT", 10),
@@ -1425,7 +1530,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
     inconel_kex_eff = (
         INCONEL_KEX_MULT
         * inconel_Kr_0
-        * np.exp(-inconel_E_Kr / (8.617e-5 * temperature_K))
+        * np.exp(-inconel_E_Kr / (8.617e-5 * temperature_K_run))
     )
 
     def make_recomb_eq_export(surface, name, filename, h2_conc):
@@ -1436,7 +1541,7 @@ def build_model(sweep_gas: str, run_id: int, results_folder: str = "results/baby
             volume_subdomain=vol_inconel,
             inconel_Kr_0=inconel_Kr_0,
             inconel_E_Kr=inconel_E_Kr,
-            temperature=temperature_K,
+            temperature=temperature_K_run,
             h2_conc=h2_conc,
             kex_0=inconel_kex_eff,
             name=name,
@@ -1556,11 +1661,21 @@ if __name__ == "__main__":
     #   run 1, 2 : pure He for the whole run.
     #   run 3    : He, then 1000 ppm H2 switched on at day 18.21.
     #   run 4    : 1000 ppm H2 from the start, then 3.5% H2 at day 17.37.
+    #   run 6    : 3.5% H2 from the start, switched OFF to pure He at day
+    #              3.22 (opposite direction of run 3/4). TRITIUM_PRODUCTION[6]
+    #              is an UNCALIBRATED neutronics placeholder (see comment at
+    #              its definition) -- not yet fit against experimental data.
+    #   run 12   : constant 3.65% H2, no switch. TRITIUM_PRODUCTION[12] is
+    #              also an UNCALIBRATED placeholder.
     RUN_SWEEP = {
         1: "He",
         2: "He",
         3: "He_then_H2",
         4: "H2",
+        6: "H2_then_He",
+        7: "He",
+        8: "He_then_H2",
+        12: "H2_const",
     }
 
     print("=== Salt-side fit parameters (Inconel: literature only) ===")
@@ -1620,12 +1735,19 @@ if __name__ == "__main__":
         c_l = eval_at(u_flibe, bb_tree_flibe, mesh_flibe, r_iface, z_test)
         c_r = eval_at(u_inconel, bb_tree_inconel, mesh_inconel, r_iface, z_test)
 
+        # Run's own temperature (matches build_model's temperature_K_run) --
+        # using the fixed module-level K_flibe/K_inconel here would make this
+        # self-consistency check wrong for any run in RUN_TEMPERATURE_C.
+        _T_run = RUN_TEMPERATURE_C.get(run_id, TEMPERATURE_C_DEFAULT) + 273.15
+        _K_flibe_run = flibe_S_0 * np.exp(-flibe_E_S / (8.617e-5 * _T_run))
+        _K_inconel_run = inconel_S_0 * np.exp(-inconel_E_S / (8.617e-5 * _T_run))
+
         print(f"c_flibe          = {c_l}")
         print(f"c_inconel        = {c_r}")
-        print(f"c_henry/K_H      = {c_l / K_flibe}")
-        print(f"(c_sievert/K_S)^2 = {(c_r / K_inconel) ** 2}")
+        print(f"c_henry/K_H      = {c_l / _K_flibe_run}")
+        print(f"(c_sievert/K_S)^2 = {(c_r / _K_inconel_run) ** 2}")
         print(
-            f"henry ratio            = {(c_l / K_flibe) / (c_r / K_inconel) ** 2:.4e}"
+            f"henry ratio            = {(c_l / _K_flibe_run) / (c_r / _K_inconel_run) ** 2:.4e}"
         )
 
         del model
